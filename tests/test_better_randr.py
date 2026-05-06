@@ -201,6 +201,109 @@ eDP connected primary 1920x1200+0+0 normal
         self.assertFalse(sim_states["SIM-3"].enabled)
         self.assertFalse(sim_states["SIM-4"].enabled)
 
+    def test_disconnected_outputs_without_geometry_are_not_position_known(self):
+        br = load_module()
+        outputs = br.parse_xrandr(
+            """Screen 0: minimum 320 x 200, current 1920 x 1200, maximum 16384 x 16384
+eDP connected primary 1920x1200+0+0 normal
+   1920x1200     60.00*+
+HDMI-A-0 disconnected
+"""
+        )
+
+        states = br.create_gui_state(outputs)
+        detached = next(state for state in states if state.name == "HDMI-A-0")
+
+        self.assertFalse(detached.connected)
+        self.assertFalse(detached.enabled)
+        self.assertFalse(detached.position_known)
+
+    def test_disconnected_outputs_with_reported_geometry_are_position_known_placeholders(self):
+        br = load_module()
+        outputs = [
+            br.Output(
+                name="eDP",
+                connected=True,
+                primary=True,
+                geometry="1920x1200+0+0",
+                width=1920,
+                height=1200,
+                x=0,
+                y=0,
+                modes=[br.Mode("1920x1200", current=True, preferred=True)],
+            ),
+            br.Output(
+                name="HDMI-A-0",
+                connected=False,
+                geometry="1920x1080+1920+0",
+                width=1920,
+                height=1080,
+                x=1920,
+                y=0,
+                modes=[br.Mode("1920x1080", current=True, preferred=True)],
+            ),
+        ]
+
+        states = br.create_gui_state(outputs)
+        detached = next(state for state in states if state.name == "HDMI-A-0")
+
+        self.assertFalse(detached.connected)
+        self.assertFalse(detached.enabled)
+        self.assertTrue(detached.position_known)
+        self.assertEqual((1920, 0, 1920, 1080), (detached.x, detached.y, detached.width, detached.height))
+        self.assertTrue(all("HDMI-A-0" not in command for command in br.build_layout_commands(states, dry_run=True)))
+
+    def test_disconnected_position_known_placeholder_can_be_marked_for_detach(self):
+        br = load_module()
+        detached = br.GuiOutputState(
+            output=br.Output(
+                name="HDMI-A-0",
+                connected=False,
+                geometry="1920x1080+1920+0",
+                width=1920,
+                height=1080,
+                x=1920,
+                y=0,
+                modes=[br.Mode("1920x1080", current=True, preferred=True)],
+            ),
+            enabled=False,
+            x=1920,
+            y=0,
+            width=1920,
+            height=1080,
+            mode="1920x1080",
+            rotation="normal",
+            primary=False,
+            position_known=False,
+            force_off=True,
+        )
+        current = br.GuiOutputState(
+            output=br.Output(
+                name="eDP",
+                connected=True,
+                primary=True,
+                geometry="1920x1200+0+0",
+                width=1920,
+                height=1200,
+                x=0,
+                y=0,
+                modes=[br.Mode("1920x1200", current=True, preferred=True)],
+            ),
+            enabled=True,
+            x=0,
+            y=0,
+            width=1920,
+            height=1200,
+            mode="1920x1200",
+            rotation="normal",
+            primary=True,
+            position_known=True,
+        )
+
+        commands = br.build_layout_commands([current, detached], dry_run=True)
+
+        self.assertIn(["xrandr", "--output", "HDMI-A-0", "--off"], commands)
+
 
 class ProjectModeCommandTests(unittest.TestCase):
     def test_extend_places_external_to_the_right(self):

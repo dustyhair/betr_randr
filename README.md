@@ -121,9 +121,14 @@ being attached or moved at the selected edge/corner. It lets you:
   the thumbnail row
 - see each monitor's rotation in the preview details, with a badge when it is
   rotated away from normal
+- see disconnected XRandR outputs with reported positions as grey disconnected
+  placeholders instead of forgetting that the output exists
+- select a disconnected placeholder only to detach it from the pending layout
 - see thumbnails relative to each overlay monitor, so the current monitor for
   that window is omitted and neighboring monitors remain selectable/visible
 - see placed monitors in the thumbnail row with a distinct color treatment
+- keep the thumbnail row scaled to fit inside the current overlay window, using
+  each monitor's largest reported mode for relative size
 - click a thumbnail, press its number, or press `n`/`Tab` to choose the attach
   candidate
 - rotate the selected candidate monitor before attaching or while moving it

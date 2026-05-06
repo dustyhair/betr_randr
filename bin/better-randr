@@ -219,7 +219,7 @@ def parse_xrandr(query: str) -> list[Output]:
             continue
 
         mode_match = MODE_RE.match(line)
-        if current and current.connected and mode_match:
+        if current and mode_match:
             rates = mode_match.group("rates")
             current.modes.append(
                 Mode(
@@ -736,6 +736,8 @@ class GuiOutputState:
     mode: str
     rotation: str
     primary: bool
+    position_known: bool = False
+    force_off: bool = False
 
     @property
     def name(self) -> str:
@@ -780,10 +782,9 @@ def create_gui_state(outputs: list[Output]) -> list[GuiOutputState]:
     right_edge = max(((output.x or 0) + (output.width or 0) for output in active_outputs), default=0)
 
     for output in outputs:
-        if not output.connected:
-            continue
         width, height = output_default_size(output)
-        enabled = output.active
+        enabled = output.connected and output.active
+        position_known = output.x is not None and output.y is not None
         x = output.x if output.x is not None else right_edge
         y = output.y if output.y is not None else 0
         if output.connected and not output.active:
@@ -800,6 +801,7 @@ def create_gui_state(outputs: list[Output]) -> list[GuiOutputState]:
                 mode=output_default_mode(output),
                 rotation=output.rotation,
                 primary=output.primary,
+                position_known=position_known,
             )
         )
 
@@ -842,6 +844,8 @@ def build_layout_commands(states: list[GuiOutputState], dry_run: bool = False) -
 
     for state in states:
         if not state.connected:
+            if state.force_off:
+                commands.append(["xrandr", "--output", state.name, "--off"])
             continue
         if state.output.simulated and not dry_run:
             continue
@@ -1251,6 +1255,7 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
             self.edge_alignment = dict(default_alignment)
             self.target_index = 0
             self.target: GuiOutputState | None = self.existing_target_for_current_placement() or self.first_available_target()
+            self.show_default_target = True
             self.status = compositor_status or "Choose an edge, press a to attach, Enter applies."
             self.show_help = False
             self.closing = False
@@ -1478,8 +1483,8 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
             return max(1, widget.get_allocated_width()), max(1, widget.get_allocated_height())
 
         def hit_visible_item(self, x: int, y: int, width: int, height: int, display_base: GuiOutputState) -> bool:
-            target = self.target or self.first_available_target()
-            rects = [self.canvas_overlay_base_rect(width, height, display_base)]
+            target = self.target or (self.first_available_target() if self.show_default_target else None)
+            rects = [self.canvas_overlay_base_rect(width, height, display_base, target)]
             if target and display_base == self.base:
                 rects.append(self.canvas_target_rect(target, rects[0]))
             rects.extend(rect for _state, rect in self.thumbnail_items(width, height, display_base))
@@ -1665,14 +1670,20 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
             return None
 
         def first_available_target(self) -> GuiOutputState | None:
-            return next((state for state in states if state != self.base and not state.enabled), None) or next(
-                (state for state in states if state != self.base and state.enabled),
+            return next((state for state in states if state != self.base and state.connected and not state.enabled), None) or next(
+                (state for state in states if state != self.base and state.connected and state.enabled),
                 None,
             )
 
         def candidates(self, base: GuiOutputState | None = None) -> list[GuiOutputState]:
             base = base or self.base
-            return [state for state in states if state != base]
+            return [state for state in states if state != base and state.connected]
+
+        def thumbnail_states(self, base: GuiOutputState | None = None) -> list[GuiOutputState]:
+            base = base or self.base
+            connected = self.candidates(base)
+            unavailable = [state for state in states if state != base and not state.connected and state.position_known]
+            return [*connected, *unavailable]
 
         def navigate_base(self, side: str) -> None:
             next_base = self.monitor_in_direction(side)
@@ -1723,6 +1734,7 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
                 self.target_index = candidates.index(self.target)
             self.target_index = (self.target_index + 1) % len(candidates)
             self.target = candidates[self.target_index]
+            self.show_default_target = True
             self.move_enabled_target_to_placement()
             self.status = f"Candidate: {self.target.name}."
             self.redraw()
@@ -1735,19 +1747,30 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
             return None
 
         def select_target_number(self, number: int) -> None:
-            candidates = self.candidates()
+            candidates = self.thumbnail_states()
             index = number - 1
             if index < 0 or index >= len(candidates):
-                self.status = f"No candidate monitor at {number}."
+                self.status = f"No monitor at {number}."
                 self.redraw()
                 return
             self.select_target(candidates[index])
 
         def select_target(self, target: GuiOutputState) -> None:
+            if not target.connected:
+                if not target.position_known:
+                    self.status = f"{target.name} is disconnected."
+                    self.redraw()
+                    return
+                self.target = target
+                self.show_default_target = True
+                self.status = f"{target.name} is disconnected. Press d to detach."
+                self.redraw()
+                return
             candidates = self.candidates()
             if target not in candidates:
                 return
             self.target = target
+            self.show_default_target = True
             self.target_index = candidates.index(target)
             self.move_enabled_target_to_placement()
             self.status = f"Candidate: {target.name}."
@@ -1761,6 +1784,10 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
             self.target = self.target or self.existing_target_for_current_placement() or self.first_available_target()
             if not self.target:
                 self.status = "No connected monitor is available to rotate."
+                self.redraw()
+                return
+            if not self.target.connected:
+                self.status = f"{self.target.name} is disconnected. Press d to detach."
                 self.redraw()
                 return
             current_index = ROTATION_CYCLE.index(self.target.rotation) if self.target.rotation in ROTATION_CYCLE else 0
@@ -1807,6 +1834,10 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
                 self.status = "No connected monitor is available to attach."
                 self.redraw()
                 return
+            if not self.target.connected:
+                self.status = f"{self.target.name} is disconnected. Press d to detach."
+                self.redraw()
+                return
             candidates = self.candidates()
             if self.target in candidates:
                 self.target_index = candidates.index(self.target)
@@ -1820,11 +1851,17 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
 
         def detach_target(self) -> None:
             if self.target and self.target != self.base:
+                target_name = self.target.name
                 self.target.enabled = False
                 self.target.primary = False
+                if not self.target.connected:
+                    self.target.force_off = True
+                    self.target.position_known = False
+                    self.target = None
+                    self.show_default_target = False
                 if not any(state.enabled and state.primary for state in states):
                     self.base.primary = True
-                self.status = f"{self.target.name} detached."
+                self.status = f"{target_name} detached."
                 self.redraw()
 
         def set_current_primary(self) -> None:
@@ -1855,8 +1892,8 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
             base_rect: tuple[int, int, int, int],
         ) -> tuple[int, int, int, int]:
             base_left, base_top, _base_right, _base_bottom = base_rect
-            width = max(90, int(state.width * self.scale))
-            height = max(58, int(state.height * self.scale))
+            width = max(24, int(state.width * self.scale))
+            height = max(18, int(state.height * self.scale))
             left = int(base_left + ((state.x - display_base.x) * self.scale))
             top = int(base_top + ((state.y - display_base.y) * self.scale))
             return left, top, left + width, top + height
@@ -1867,16 +1904,16 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
 
             base_left, base_top, _base_right, _base_bottom = base_rect
             target_x, target_y = self.placement_position(target)
-            target_w = max(90, int(target.width * self.scale))
-            target_h = max(58, int(target.height * self.scale))
+            target_w = max(24, int(target.width * self.scale))
+            target_h = max(18, int(target.height * self.scale))
             left = int(base_left + ((target_x - self.base.x) * self.scale))
             top = int(base_top + ((target_y - self.base.y) * self.scale))
             return left, top, left + target_w, top + target_h
 
         def canvas_state_rect(self, state: GuiOutputState, base_rect: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
             base_left, base_top, _base_right, _base_bottom = base_rect
-            width = max(90, int(state.width * self.scale))
-            height = max(58, int(state.height * self.scale))
+            width = max(24, int(state.width * self.scale))
+            height = max(18, int(state.height * self.scale))
             left = int(base_left + ((state.x - self.base.x) * self.scale))
             top = int(base_top + ((state.y - self.base.y) * self.scale))
             return left, top, left + width, top + height
@@ -1888,20 +1925,24 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
             cr.paint()
             cr.set_operator(cairo.OPERATOR_OVER)
 
-            target = self.target or self.first_available_target()
+            target = self.target or (self.first_available_target() if self.show_default_target else None)
             display_base = self.area_bases.get(_widget, self.base)
             perspective_alpha = 1.0 if display_base == self.base else 0.42
-            base_rect = self.canvas_overlay_base_rect(width, height, display_base)
+            base_rect = self.canvas_overlay_base_rect(width, height, display_base, target)
             if display_base == self.base:
                 self.draw_monitor(cr, self.base, base_rect, "#3f8fd2", "#f2f4f8", "current")
                 self.draw_selected_edge(cr, base_rect)
                 self.draw_placed_monitors(cr, target, base_rect, display_base)
 
                 if target:
-                    target_rect = self.canvas_target_rect(target, base_rect)
-                    fill = "#55bfa3" if target.enabled else "#222936"
-                    outline = "#55bfa3" if target.enabled else "#e0a84f"
-                    self.draw_monitor(cr, target, target_rect, fill, outline, "attached" if target.enabled else "available")
+                    if not target.connected and target.position_known:
+                        target_rect = self.canvas_display_rect(target, display_base, base_rect)
+                        self.draw_monitor(cr, target, target_rect, "#4b5563", "#d1d5db", "disconnected", alpha=0.86)
+                    else:
+                        target_rect = self.canvas_target_rect(target, base_rect)
+                        fill = "#55bfa3" if target.enabled else "#222936"
+                        outline = "#55bfa3" if target.enabled else "#e0a84f"
+                        self.draw_monitor(cr, target, target_rect, fill, outline, "attached" if target.enabled else "available")
                 else:
                     side, align = self.placement()
                     self.draw_text(cr, width // 2, height // 2, f"No monitor available for {side} / {align}", "#e0a84f", 12, anchor="center")
@@ -1914,15 +1955,58 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
                 self.draw_help_panel(cr, height)
             return False
 
-        def canvas_overlay_base_rect(self, width: int, height: int, display_base: GuiOutputState) -> tuple[int, int, int, int]:
-            available_w = max(1, width * 0.50)
-            available_h = max(1, height * 0.50)
-            self.scale = min(available_w / display_base.width, available_h / display_base.height, 0.24)
+        def canvas_overlay_base_rect(
+            self,
+            width: int,
+            height: int,
+            display_base: GuiOutputState,
+            target: GuiOutputState | None = None,
+        ) -> tuple[int, int, int, int]:
+            min_x, min_y, max_x, max_y = self.canvas_layout_bounds(display_base, target)
+            viewport_left = 24
+            viewport_right = max(viewport_left + 1, width - 24)
+            viewport_top = 32
+            viewport_bottom = max(viewport_top + 1, height - 104)
+            center_x = (viewport_left + viewport_right) / 2
+            center_y = (viewport_top + viewport_bottom) / 2
+            base_center_x = display_base.x + (display_base.width / 2)
+            base_center_y = display_base.y + (display_base.height / 2)
+            scale_limits = [0.24]
+            spans = (
+                (base_center_x - min_x, center_x - viewport_left),
+                (max_x - base_center_x, viewport_right - center_x),
+                (base_center_y - min_y, center_y - viewport_top),
+                (max_y - base_center_y, viewport_bottom - center_y),
+            )
+            for layout_span, viewport_span in spans:
+                if layout_span > 0:
+                    scale_limits.append(viewport_span / layout_span)
+            self.scale = max(0.01, min(scale_limits))
             monitor_w = int(display_base.width * self.scale)
             monitor_h = int(display_base.height * self.scale)
-            left = (width - monitor_w) // 2
-            top = max(70, (height - monitor_h) // 2 - 36)
+            left = int(center_x - (monitor_w / 2))
+            top = int(center_y - (monitor_h / 2))
             return left, top, left + monitor_w, top + monitor_h
+
+        def canvas_layout_bounds(
+            self,
+            display_base: GuiOutputState,
+            target: GuiOutputState | None = None,
+        ) -> tuple[int, int, int, int]:
+            rects = [(display_base.x, display_base.y, display_base.width, display_base.height)]
+            for state in states:
+                if state == display_base:
+                    continue
+                if state.enabled or (not state.connected and state.position_known):
+                    rects.append((state.x, state.y, state.width, state.height))
+            if target and display_base == self.base and target.connected and not target.enabled:
+                target_x, target_y = self.placement_position(target)
+                rects.append((target_x, target_y, target.width, target.height))
+            min_x = min(x for x, _y, _w, _h in rects)
+            min_y = min(y for _x, y, _w, _h in rects)
+            max_x = max(x + w for x, _y, w, _h in rects)
+            max_y = max(y + h for _x, y, _w, h in rects)
+            return min_x, min_y, max_x, max_y
 
         def draw_placed_monitors(
             self,
@@ -1933,13 +2017,20 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
             perspective_alpha: float = 1.0,
         ) -> None:
             for state in states:
-                if state == display_base or state == target or not state.enabled:
+                unavailable_placeholder = not state.connected and state.position_known
+                if state == display_base or state == target or (not state.enabled and not unavailable_placeholder):
                     continue
                 rect = self.canvas_display_rect(state, display_base, base_rect)
-                fill = "#3f8fd2" if state == self.base else "#374151"
-                outline = "#f2f4f8" if state == self.base else "#7d8796"
-                label = "current" if state == self.base else "placed"
-                monitor_alpha = perspective_alpha if state == self.base else min(perspective_alpha, 0.50)
+                if unavailable_placeholder:
+                    fill = "#4b5563"
+                    outline = "#c2cad6"
+                    label = "disconnected"
+                    monitor_alpha = min(perspective_alpha, 0.72)
+                else:
+                    fill = "#3f8fd2" if state == self.base else "#374151"
+                    outline = "#f2f4f8" if state == self.base else "#7d8796"
+                    label = "current" if state == self.base else "placed"
+                    monitor_alpha = perspective_alpha if state == self.base else min(perspective_alpha, 0.50)
                 self.draw_monitor(cr, state, rect, fill, outline, label, alpha=monitor_alpha)
 
         def draw_monitor(
@@ -1959,6 +2050,11 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
             if state.output.simulated:
                 text += "  simulated"
             self.draw_text(cr, left + 14, top + 43, text, "#edf1f5", 10, alpha=alpha)
+            if not state.connected:
+                badge_w = min(118, max(34, (right - left) - 28))
+                badge_left = right - badge_w - 12
+                if badge_left > left + 12:
+                    self.draw_unavailable_badge(cr, badge_left, bottom - 33, right - 12, bottom - 12, alpha)
             if state.rotation != "normal":
                 badge_w = min(62, max(34, (right - left) - 28))
                 badge_left = right - badge_w - 12
@@ -1985,6 +2081,12 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
             self.draw_rectangle(cr, left, top, right, bottom, "#4fd1c5", "#4fd1c5", 1, fill_alpha=alpha, outline_alpha=alpha)
             self.draw_text(cr, (left + right) // 2, (top + bottom) // 2, rotation.upper(), "#0b1220", 8, bold=True, anchor="center", alpha=alpha)
 
+        def draw_unavailable_badge(self, cr: object, left: int, top: int, right: int, bottom: int, alpha: float = 1.0) -> None:
+            if right - left < 34:
+                return
+            self.draw_rectangle(cr, left, top, right, bottom, "#d1d5db", "#d1d5db", 1, fill_alpha=alpha, outline_alpha=alpha)
+            self.draw_text(cr, (left + right) // 2, (top + bottom) // 2, "DISCONNECTED", "#111827", 8, bold=True, anchor="center", alpha=alpha)
+
         def draw_primary_badge(self, cr: object, left: int, top: int, right: int, bottom: int, alpha: float = 1.0) -> None:
             if right - left < 34:
                 return
@@ -2001,24 +2103,26 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
             height: int,
             display_base: GuiOutputState | None = None,
         ) -> list[tuple[GuiOutputState, tuple[int, int, int, int]]]:
-            candidates = self.candidates(display_base)
+            candidates = self.thumbnail_states(display_base)
             if not candidates:
                 return []
 
             sizes = [self.candidate_display_size(state) for state in candidates]
             max_source_w = max(source_w for source_w, _source_h in sizes)
             max_source_h = max(source_h for _source_w, source_h in sizes)
-            gap = 14
-            max_thumb_w = 132
-            max_thumb_h = 74
+            available_w = max(1, width - 48)
+            available_h = max(28, height - 96)
+            gap = min(14, max(4, available_w // max(1, len(candidates) * 10)))
+            max_thumb_w = min(132, max(34, (available_w - (gap * (len(candidates) - 1))) // max(1, len(candidates))))
+            max_thumb_h = min(74, max(24, int(available_h * 0.18)))
             scale = min(max_thumb_w / max_source_w, max_thumb_h / max_source_h)
             thumb_sizes = [
-                (max(50, int(source_w * scale)), max(34, int(source_h * scale))) for source_w, source_h in sizes
+                (max(28, int(source_w * scale)), max(20, int(source_h * scale))) for source_w, source_h in sizes
             ]
             total_w = sum(thumb_w for thumb_w, _thumb_h in thumb_sizes) + (gap * (len(candidates) - 1))
-            if total_w > width - 48:
-                fit_scale = max(0.45, (width - 48 - (gap * (len(candidates) - 1))) / max(1, sum(thumb_w for thumb_w, _thumb_h in thumb_sizes)))
-                thumb_sizes = [(max(40, int(thumb_w * fit_scale)), max(28, int(thumb_h * fit_scale))) for thumb_w, thumb_h in thumb_sizes]
+            if total_w > available_w:
+                fit_scale = max(0.1, (available_w - (gap * (len(candidates) - 1))) / max(1, sum(thumb_w for thumb_w, _thumb_h in thumb_sizes)))
+                thumb_sizes = [(max(22, int(thumb_w * fit_scale)), max(16, int(thumb_h * fit_scale))) for thumb_w, thumb_h in thumb_sizes]
                 total_w = sum(thumb_w for thumb_w, _thumb_h in thumb_sizes) + (gap * (len(candidates) - 1))
 
             x = max(24, (width - total_w) // 2)
@@ -2046,6 +2150,10 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
                     fill = "#2f7fbd"
                     outline = "#f2f4f8"
                     fill_alpha = 1.0
+                elif not state.connected:
+                    fill = "#4b5563"
+                    outline = "#c2cad6"
+                    fill_alpha = 0.72
                 elif state.enabled:
                     fill = "#2f3744"
                     outline = "#7d8796"
@@ -2061,9 +2169,11 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
                     self.draw_rectangle(cr, left + 5, top + 5, right - 5, bottom - 5, fill, "#e0a84f", 2, fill_alpha=alpha, outline_alpha=alpha)
                 self.draw_text(cr, left + 8, top + 8, str(index), "#e0a84f", 9, bold=True, alpha=alpha)
                 self.draw_text(cr, left + 22, top + 8, state.name, "#ffffff", 9, bold=True, alpha=alpha)
+                if not state.connected:
+                    self.draw_unavailable_thumbnail_badge(cr, right - 22, top + 6, right - 6, top + 22, alpha)
                 if state.primary:
                     self.draw_primary_thumbnail_badge(cr, right - 22, top + 6, right - 6, top + 22, alpha)
-                status = "placed" if state.enabled else "available"
+                status = "disconnected" if not state.connected else "placed" if state.enabled else "available"
                 if state.output.simulated:
                     status = f"{status} sim"
                 if state.rotation != "normal":
@@ -2139,6 +2249,10 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
         def draw_primary_thumbnail_badge(self, cr: object, left: int, top: int, right: int, bottom: int, alpha: float = 1.0) -> None:
             self.draw_rectangle(cr, left, top, right, bottom, "#e0a84f", "#e0a84f", 1, fill_alpha=alpha, outline_alpha=alpha)
             self.draw_text(cr, (left + right) // 2, (top + bottom) // 2, "P", "#111827", 8, bold=True, anchor="center", alpha=alpha)
+
+        def draw_unavailable_thumbnail_badge(self, cr: object, left: int, top: int, right: int, bottom: int, alpha: float = 1.0) -> None:
+            self.draw_rectangle(cr, left, top, right, bottom, "#d1d5db", "#d1d5db", 1, fill_alpha=alpha, outline_alpha=alpha)
+            self.draw_text(cr, (left + right) // 2, (top + bottom) // 2, "!", "#111827", 8, bold=True, anchor="center", alpha=alpha)
 
         def draw_translucent_rectangle(
             self,
