@@ -1,0 +1,2423 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from typing import Iterable
+
+
+GEOMETRY_RE = re.compile(r"(?P<w>\d+)x(?P<h>\d+)\+(?P<x>-?\d+)\+(?P<y>-?\d+)")
+OUTPUT_RE = re.compile(r"^(?P<name>\S+)\s+(?P<state>connected|disconnected)\b(?P<rest>.*)$")
+MODE_RE = re.compile(r"^\s+(?P<mode>\d+x\d+)\s+(?P<rates>.+)$")
+SIZE_RE = re.compile(r"^(?P<w>\d+)x(?P<h>\d+)$")
+
+ROTATIONS = ("normal", "left", "right", "inverted")
+ROTATION_CYCLE = ("normal", "right", "inverted", "left")
+PROJECT_MODES = ("internal-only", "duplicate", "extend", "external-only")
+COMPOSITOR_MODES = ("auto", "none", "picom", "xcompmgr")
+SIMULATED_ATTACHMENTS = ("attached", "right", "left", "above", "below")
+SIMULATED_LAYOUTS = ("four-one-attached",)
+
+XRANDR_RELATIONS = {
+    "mirror": "--same-as",
+}
+
+DEFAULT_ROFI_THEME_STR = """
+window {
+  width: 760px;
+}
+mainbox {
+  spacing: 8px;
+  padding: 12px;
+}
+inputbar {
+  spacing: 8px;
+}
+listview {
+  lines: 9;
+  spacing: 4px;
+}
+element {
+  padding: 6px 8px;
+}
+element-text {
+  font: "monospace 10";
+}
+textbox {
+  font: "monospace 10";
+}
+"""
+
+
+@dataclass
+class Mode:
+    name: str
+    current: bool = False
+    preferred: bool = False
+
+
+@dataclass
+class Output:
+    name: str
+    connected: bool
+    simulated: bool = False
+    primary: bool = False
+    geometry: str | None = None
+    width: int | None = None
+    height: int | None = None
+    x: int | None = None
+    y: int | None = None
+    rotation: str = "normal"
+    modes: list[Mode] = field(default_factory=list)
+
+    @property
+    def active(self) -> bool:
+        return self.geometry is not None
+
+    @property
+    def preferred_mode(self) -> Mode | None:
+        return next((mode for mode in self.modes if mode.preferred), None)
+
+    @property
+    def current_mode(self) -> Mode | None:
+        return next((mode for mode in self.modes if mode.current), None)
+
+    @property
+    def resolution(self) -> str | None:
+        if self.width and self.height:
+            return f"{self.width}x{self.height}"
+        if self.current_mode:
+            return self.current_mode.name
+        if self.preferred_mode:
+            return self.preferred_mode.name
+        return None
+
+
+def require_binary(name: str) -> None:
+    if shutil.which(name) is None:
+        raise SystemExit(f"Missing required command: {name}")
+
+
+def run_command(args: list[str], dry_run: bool) -> None:
+    if dry_run:
+        print(" ".join(args))
+        return
+    subprocess.run(args, check=True)
+
+
+def compositor_selection_atom(display: str | None = None) -> str:
+    display = display if display is not None else os.environ.get("DISPLAY", "")
+    screen = "0"
+    match = re.search(r"\.(\d+)$", display)
+    if match:
+        screen = match.group(1)
+    return f"_NET_WM_CM_S{screen}"
+
+
+def compositor_running() -> bool:
+    if shutil.which("xprop") is None:
+        return False
+    atom = compositor_selection_atom()
+    try:
+        result = subprocess.run(["xprop", "-root", atom], check=False, text=True, capture_output=True)
+    except OSError:
+        return False
+    output = f"{result.stdout}\n{result.stderr}".lower()
+    return result.returncode == 0 and "not found" not in output
+
+
+def start_compositor(command_name: str) -> bool:
+    binary = shutil.which(command_name)
+    if binary is None:
+        return False
+
+    if command_name == "picom":
+        command = [binary, "--backend", "xrender", "--daemon"]
+        try:
+            subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except (OSError, subprocess.CalledProcessError):
+            return False
+
+    if command_name == "xcompmgr":
+        command = [binary, "-n"]
+        try:
+            subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return True
+        except OSError:
+            return False
+
+    return False
+
+
+def ensure_compositor(mode: str) -> str | None:
+    if mode == "none":
+        return None
+    if compositor_running():
+        return "Using existing X compositor."
+
+    candidates = ["picom", "xcompmgr"] if mode == "auto" else [mode]
+    for candidate in candidates:
+        if start_compositor(candidate):
+            return f"Started {candidate} for overlay transparency."
+
+    if mode == "auto":
+        return "No compositor found. Install picom or xcompmgr for full transparency."
+    return f"Could not start {mode}. Install it or use --compositor auto."
+
+
+def xrandr_query() -> str:
+    return subprocess.run(
+        ["xrandr", "--query"],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout
+
+
+def parse_xrandr(query: str) -> list[Output]:
+    outputs: list[Output] = []
+    current: Output | None = None
+
+    for line in query.splitlines():
+        output_match = OUTPUT_RE.match(line)
+        if output_match:
+            rest = output_match.group("rest")
+            geometry_match = GEOMETRY_RE.search(rest)
+            rotation = "normal"
+            if geometry_match:
+                rest_after_geometry = rest[geometry_match.end() :].strip()
+                rotation_candidate = rest_after_geometry.split(maxsplit=1)[0] if rest_after_geometry else ""
+                if rotation_candidate in ROTATIONS:
+                    rotation = rotation_candidate
+
+            current = Output(
+                name=output_match.group("name"),
+                connected=output_match.group("state") == "connected",
+                primary=" primary " in f" {rest} ",
+                geometry=geometry_match.group(0) if geometry_match else None,
+                width=int(geometry_match.group("w")) if geometry_match else None,
+                height=int(geometry_match.group("h")) if geometry_match else None,
+                x=int(geometry_match.group("x")) if geometry_match else None,
+                y=int(geometry_match.group("y")) if geometry_match else None,
+                rotation=rotation,
+            )
+            outputs.append(current)
+            continue
+
+        mode_match = MODE_RE.match(line)
+        if current and current.connected and mode_match:
+            rates = mode_match.group("rates")
+            current.modes.append(
+                Mode(
+                    name=mode_match.group("mode"),
+                    current="*" in rates,
+                    preferred="+" in rates,
+                )
+            )
+
+    return outputs
+
+
+def add_simulated_monitor(outputs: list[Output], spec: str) -> list[Output]:
+    name, mode, geometry, attachment = parse_simulated_monitor(spec)
+    if any(output.name == name for output in outputs):
+        raise SystemExit(f"Simulated monitor name already exists: {name}")
+
+    width = height = x = y = None
+    if geometry:
+        width = int(geometry.group("w"))
+        height = int(geometry.group("h"))
+        x = int(geometry.group("x"))
+        y = int(geometry.group("y"))
+    elif attachment:
+        width, height, x, y = simulated_attachment_geometry(outputs, mode, attachment)
+
+    outputs.append(
+        Output(
+            name=name,
+            connected=True,
+            simulated=True,
+            geometry=f"{width}x{height}+{x}+{y}" if x is not None and y is not None and width is not None and height is not None else None,
+            width=width,
+            height=height,
+            x=x,
+            y=y,
+            modes=[Mode(mode, preferred=True, current=x is not None and y is not None)],
+        )
+    )
+    return outputs
+
+
+def parse_simulated_monitor(spec: str) -> tuple[str, str, re.Match[str] | None, str | None]:
+    if ":" not in spec:
+        return spec, "1920x1080", None, None
+
+    name, mode_part = spec.split(":", maxsplit=1)
+    if not name:
+        raise SystemExit("Simulated monitor name cannot be empty")
+    mode_or_geometry, separator, attachment = mode_part.partition("@")
+    attachment = attachment if separator else None
+    if attachment and attachment not in SIMULATED_ATTACHMENTS:
+        raise SystemExit(f"Simulated monitor attachment must be one of: {', '.join(SIMULATED_ATTACHMENTS)}")
+    geometry = GEOMETRY_RE.fullmatch(mode_or_geometry)
+    mode = f"{geometry.group('w')}x{geometry.group('h')}" if geometry else mode_or_geometry
+    if not parse_size(mode):
+        raise SystemExit("Simulated monitor mode must look like WIDTHxHEIGHT, WIDTHxHEIGHT+X+Y, or WIDTHxHEIGHT@right")
+    if geometry and attachment:
+        raise SystemExit("Simulated monitor cannot combine +X+Y geometry with @attachment")
+    return name, mode, geometry, attachment
+
+
+def simulated_attachment_geometry(outputs: list[Output], mode: str, attachment: str) -> tuple[int, int, int, int]:
+    size = parse_size(mode)
+    if not size:
+        raise SystemExit("Simulated monitor mode must look like WIDTHxHEIGHT")
+    width, height = size
+    base = next((output for output in outputs if output.active and output.primary), None) or next(
+        (output for output in outputs if output.active),
+        None,
+    )
+    if not base:
+        return width, height, 0, 0
+    base_x = base.x or 0
+    base_y = base.y or 0
+    base_w, base_h = output_default_size(base)
+    if attachment in {"attached", "right"}:
+        return width, height, base_x + base_w, base_y
+    if attachment == "left":
+        return width, height, base_x - width, base_y
+    if attachment == "above":
+        return width, height, base_x, base_y - height
+    return width, height, base_x, base_y + base_h
+
+
+def add_simulated_layout(outputs: list[Output], layout: str) -> list[Output]:
+    if layout == "four-one-attached":
+        for spec in (
+            "SIM-1:1920x1080@right",
+            "SIM-2:2560x1440",
+            "SIM-3:1600x900",
+            "SIM-4:3840x2160",
+        ):
+            add_simulated_monitor(outputs, spec)
+        return outputs
+    raise SystemExit(f"Unknown simulated layout: {layout}")
+
+
+def markup(text: str, *, foreground: str | None = None, weight: str | None = None) -> str:
+    attrs = []
+    if foreground:
+        attrs.append(f'foreground="{foreground}"')
+    if weight:
+        attrs.append(f'weight="{weight}"')
+    escaped = html.escape(text)
+    return f"<span {' '.join(attrs)}>{escaped}</span>" if attrs else escaped
+
+
+def plain_markup(text: str) -> str:
+    return html.unescape(re.sub(r"<[^>]*>", "", text))
+
+
+def dim(text: str) -> str:
+    return markup(text, foreground="#8a8f98")
+
+
+def good(text: str) -> str:
+    return markup(text, foreground="#5cc8a1", weight="bold")
+
+
+def warn(text: str) -> str:
+    return markup(text, foreground="#e0a84f", weight="bold")
+
+
+def strong(text: str) -> str:
+    return markup(text, weight="bold")
+
+
+def rofi_choose(prompt: str, choices: Iterable[str], message: str | None = None) -> str | None:
+    entries = list(choices)
+    if not entries:
+        return None
+
+    command = [
+        "rofi",
+        "-dmenu",
+        "-i",
+        "-no-custom",
+        "-markup",
+        "-markup-rows",
+        "-p",
+        prompt,
+    ]
+    if message:
+        command.extend(["-mesg", message])
+    theme_str = os.environ.get("BETTER_RANDR_ROFI_THEME_STR", DEFAULT_ROFI_THEME_STR)
+    if theme_str:
+        command.extend(["-theme-str", theme_str])
+
+    result = subprocess.run(
+        command,
+        input="\n".join(entries),
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        return None
+
+    selected = result.stdout.strip()
+    return selected if selected in entries else None
+
+
+def output_label(output: Output) -> str:
+    if not output.connected:
+        return f"{dim('disconnected')}  {markup(output.name)}"
+
+    status = good("active") if output.active else warn("available")
+    parts = [status, strong(output.name)]
+    if output.simulated:
+        parts.append(dim("simulated"))
+    if output.primary:
+        parts.append(markup("primary", foreground="#7aa2f7", weight="bold"))
+    if output.geometry:
+        parts.append(dim(f"{output.resolution}  pos {output.x},{output.y}"))
+        if output.rotation != "normal":
+            parts.append(warn(output.rotation))
+    elif output.preferred_mode:
+        parts.append(dim(f"preferred {output.preferred_mode.name}"))
+    return " ".join(parts)
+
+
+def layout_message(outputs: list[Output]) -> str:
+    active_outputs = [output for output in outputs if output.active]
+    if not active_outputs:
+        connected_off = ", ".join(output.name for output in outputs if output.connected)
+        return f"{strong('Layout')}\n{dim('No active outputs.')} Connected: {html.escape(connected_off or 'none')}"
+
+    layout_lines = render_layout(active_outputs)
+    detail_lines = [
+        f"{strong(output.name)}  {dim(output.resolution or 'unknown')}"
+        f"  {dim(f'pos {output.x},{output.y}')}"
+        f"{'  ' + markup('primary', foreground='#7aa2f7', weight='bold') if output.primary else ''}"
+        f"{'' if output.rotation == 'normal' else '  ' + warn(output.rotation)}"
+        for output in sorted(active_outputs, key=lambda item: (item.y or 0, item.x or 0, item.name))
+    ]
+    connected_off = [output.name for output in outputs if output.connected and not output.active]
+    if connected_off:
+        detail_lines.append(f"{dim('available:')} {html.escape(', '.join(connected_off))}")
+    return "\n".join([strong("Layout"), *layout_lines, "", *detail_lines])
+
+
+def render_layout(outputs: list[Output]) -> list[str]:
+    min_x = min(output.x or 0 for output in outputs)
+    min_y = min(output.y or 0 for output in outputs)
+    max_x = max((output.x or 0) + (output.width or 1) for output in outputs)
+    max_y = max((output.y or 0) + (output.height or 1) for output in outputs)
+    total_w = max(1, max_x - min_x)
+    total_h = max(1, max_y - min_y)
+
+    canvas_w = 54
+    canvas_h = 12
+    scale = min((canvas_w - 1) / total_w, (canvas_h - 1) / total_h)
+    grid = [[" " for _ in range(canvas_w)] for _ in range(canvas_h)]
+
+    for index, output in enumerate(sorted(outputs, key=lambda item: (item.y or 0, item.x or 0, item.name)), start=1):
+        left = int(((output.x or 0) - min_x) * scale)
+        top = int(((output.y or 0) - min_y) * scale)
+        right = max(left + 5, int((((output.x or 0) + (output.width or 1)) - min_x) * scale))
+        bottom = max(top + 2, int((((output.y or 0) + (output.height or 1)) - min_y) * scale))
+        right = min(canvas_w - 1, right)
+        bottom = min(canvas_h - 1, bottom)
+
+        horizontal = "=" if output.primary else "-"
+        for x in range(left, right + 1):
+            grid[top][x] = horizontal
+            grid[bottom][x] = horizontal
+        for y in range(top, bottom + 1):
+            grid[y][left] = "|"
+            grid[y][right] = "|"
+        grid[top][left] = "+"
+        grid[top][right] = "+"
+        grid[bottom][left] = "+"
+        grid[bottom][right] = "+"
+
+        label = f"{index}:{output.name} {output.resolution or ''}"
+        for offset, char in enumerate(label[: max(0, right - left - 1)]):
+            grid[top + 1][left + 1 + offset] = char
+
+    return [dim("".join(row).rstrip()) for row in grid if "".join(row).strip()]
+
+
+def select_output(outputs: list[Output]) -> Output | None:
+    labels = {output_label(output): output for output in outputs if output.connected}
+    selected = rofi_choose("display", labels.keys(), layout_message(outputs))
+    return labels.get(selected) if selected else None
+
+
+def project_mode_label(mode: str) -> str:
+    labels = {
+        "internal-only": f"{strong('internal only')}  {dim('use laptop/current primary display')}",
+        "duplicate": f"{strong('duplicate')}  {dim('mirror internal/current primary to external')}",
+        "extend": f"{strong('extend')}  {dim('place external display to the right')}",
+        "external-only": f"{strong('external only')}  {dim('use first external display')}",
+    }
+    return labels[mode]
+
+
+def select_project_mode(outputs: list[Output]) -> str | None:
+    labels = {project_mode_label(mode): mode for mode in PROJECT_MODES}
+    labels[f"{strong('advanced placement overlay')}  {dim('keyboard attach and edge placement')}"] = "gui"
+    labels[f"{strong('monitor actions')}  {dim('resolution, rotate, primary, manual placement')}"] = "monitor-actions"
+    selected = rofi_choose("display mode", labels.keys(), layout_message(outputs))
+    return labels.get(selected) if selected else None
+
+
+def select_start_action(outputs: list[Output]) -> str | Output | None:
+    labels: dict[str, str | Output] = {project_mode_label(mode): mode for mode in PROJECT_MODES}
+    labels[f"{strong('advanced placement overlay')}  {dim('keyboard attach and edge placement')}"] = "gui"
+    labels.update({output_label(output): output for output in outputs if output.connected})
+    selected = rofi_choose("better-randr", labels.keys(), layout_message(outputs))
+    return labels.get(selected) if selected else None
+
+
+def select_action(output: Output, outputs: list[Output]) -> str | None:
+    actions = []
+    if output.connected and output.active:
+        if any(candidate.active and candidate.name != output.name for candidate in outputs):
+            actions.append(f"{strong('move / align')}  {dim('snap beside another display')}")
+        actions.extend(
+            [
+                f"{strong('set resolution')}  {dim(output.resolution or 'choose mode')}",
+                f"{strong('rotate')}  {dim(output.rotation)}",
+                f"{strong('set primary')}  {dim('make this the main output')}",
+                f"{warn('disable')}  {dim('turn this output off')}",
+            ]
+        )
+    elif output.connected:
+        actions.append(f"{good('enable')}  {dim('attach this output')}")
+
+    action_map = {plain_markup(action).split("  ", maxsplit=1)[0]: action for action in actions}
+    selected = rofi_choose(output.name, actions, layout_message(outputs))
+    if not selected:
+        return None
+    plain = plain_markup(selected).split("  ", maxsplit=1)[0]
+    return plain if plain in action_map else None
+
+
+def select_mode(output: Output) -> str | None:
+    labels: dict[str, str] = {f"{strong('auto')}  {dim('preferred mode')}": "auto"}
+    for mode in output.modes:
+        suffixes = []
+        if mode.current:
+            suffixes.append("current")
+        if mode.preferred:
+            suffixes.append("preferred")
+        label = strong(mode.name) if not suffixes else f"{strong(mode.name)}  {dim(', '.join(suffixes))}"
+        labels[label] = mode.name
+
+    selected = rofi_choose("resolution", labels.keys())
+    return labels.get(selected) if selected else None
+
+
+def parse_size(mode: str) -> tuple[int, int] | None:
+    size_match = SIZE_RE.match(mode)
+    if not size_match:
+        return None
+    return int(size_match.group("w")), int(size_match.group("h"))
+
+
+def selected_output_size(output: Output, mode: str | None = None) -> tuple[int, int] | None:
+    if mode and mode != "auto":
+        return parse_size(mode)
+    if output.width and output.height:
+        return output.width, output.height
+    if output.current_mode:
+        return parse_size(output.current_mode.name)
+    if output.preferred_mode:
+        return parse_size(output.preferred_mode.name)
+    return None
+
+
+def placement_choices(output: Output, outputs: list[Output], size: tuple[int, int]) -> dict[str, list[str]]:
+    width, height = size
+    active_outputs = [candidate for candidate in outputs if candidate.active and candidate.name != output.name]
+    labels: dict[str, list[str]] = {}
+
+    for target in active_outputs:
+        if target.x is None or target.y is None or target.width is None or target.height is None:
+            continue
+
+        right_x = target.x + target.width
+        left_x = target.x - width
+        above_y = target.y - height
+        below_y = target.y + target.height
+        middle_y = target.y + ((target.height - height) // 2)
+        bottom_y = target.y + target.height - height
+        middle_x = target.x + ((target.width - width) // 2)
+        right_aligned_x = target.x + target.width - width
+
+        placements = [
+            ("right of", "top aligned", right_x, target.y),
+            ("right of", "centered", right_x, middle_y),
+            ("right of", "bottom aligned", right_x, bottom_y),
+            ("left of", "top aligned", left_x, target.y),
+            ("left of", "centered", left_x, middle_y),
+            ("left of", "bottom aligned", left_x, bottom_y),
+            ("above", "left aligned", target.x, above_y),
+            ("above", "centered", middle_x, above_y),
+            ("above", "right aligned", right_aligned_x, above_y),
+            ("below", "left aligned", target.x, below_y),
+            ("below", "centered", middle_x, below_y),
+            ("below", "right aligned", right_aligned_x, below_y),
+        ]
+
+        for side, alignment, x, y in placements:
+            labels[placement_label(output, target, side, alignment, x, y)] = ["--pos", f"{x}x{y}"]
+
+        labels[f"{strong('mirror')} {strong(target.name)}  {dim('same position and content')}"] = [
+            XRANDR_RELATIONS["mirror"],
+            target.name,
+        ]
+
+    return labels
+
+
+def placement_label(output: Output, target: Output, side: str, alignment: str, x: int, y: int) -> str:
+    relation_symbols = {
+        "right of": f"[{target.name}] [{output.name}]",
+        "left of": f"[{output.name}] [{target.name}]",
+        "above": f"[{output.name}]\n[{target.name}]",
+        "below": f"[{target.name}]\n[{output.name}]",
+    }
+    visual = relation_symbols.get(side, f"{output.name} {side} {target.name}")
+    one_line_visual = visual.replace("\n", " / ")
+    return (
+        f"{strong(side)} {strong(target.name)}  "
+        f"{dim(alignment)}  "
+        f"{dim(one_line_visual)}  "
+        f"{dim(f'pos {x},{y}')}"
+    )
+
+
+def select_placement_args(output: Output, outputs: list[Output], size: tuple[int, int]) -> list[str] | None:
+    labels = placement_choices(output, outputs, size)
+    if not labels:
+        return None
+
+    selected = rofi_choose("position", labels.keys(), layout_message(outputs))
+    return labels.get(selected) if selected else None
+
+
+def select_rotation(output: Output, outputs: list[Output]) -> str | None:
+    labels = {
+        f"{strong(rotation)}  {dim('current' if rotation == output.rotation else rotation_hint(rotation))}": rotation
+        for rotation in ROTATIONS
+    }
+    selected = rofi_choose("rotation", labels.keys(), layout_message(outputs))
+    return labels.get(selected) if selected else None
+
+
+def rotation_hint(rotation: str) -> str:
+    hints = {
+        "normal": "landscape",
+        "left": "portrait counterclockwise",
+        "right": "portrait clockwise",
+        "inverted": "upside down",
+    }
+    return hints[rotation]
+
+
+def is_internal_output(output: Output) -> bool:
+    return output.name.startswith(("eDP", "LVDS"))
+
+
+def project_outputs(outputs: list[Output], dry_run: bool) -> list[Output]:
+    return [output for output in outputs if output.connected and (dry_run or not output.simulated)]
+
+
+def choose_internal_output(outputs: list[Output]) -> Output | None:
+    return next((output for output in outputs if is_internal_output(output)), None) or next(
+        (output for output in outputs if output.primary and output.active),
+        None,
+    ) or next((output for output in outputs if output.active), None) or next(iter(outputs), None)
+
+
+def choose_external_output(outputs: list[Output], internal: Output | None) -> Output | None:
+    return next((output for output in outputs if output != internal), None)
+
+
+def output_enable_args(output: Output) -> list[str]:
+    if output.preferred_mode:
+        return ["--mode", output.preferred_mode.name]
+    return ["--auto"]
+
+
+def off_command(output: Output) -> list[str] | None:
+    if output.active:
+        return ["xrandr", "--output", output.name, "--off"]
+    return None
+
+
+def build_project_commands(outputs: list[Output], mode: str, dry_run: bool = False) -> list[list[str]]:
+    usable_outputs = project_outputs(outputs, dry_run)
+    internal = choose_internal_output(usable_outputs)
+    external = choose_external_output(usable_outputs, internal)
+    commands: list[list[str]] = []
+
+    if mode == "internal-only":
+        if internal:
+            commands.append(["xrandr", "--output", internal.name, *output_enable_args(internal), "--pos", "0x0", "--primary"])
+        commands.extend(command for output in usable_outputs if output != internal for command in [off_command(output)] if command)
+        return commands
+
+    if mode in {"external-only", "duplicate", "extend"} and not external:
+        return commands
+
+    if mode == "external-only":
+        commands.append(["xrandr", "--output", external.name, *output_enable_args(external), "--pos", "0x0", "--primary"])
+        commands.extend(command for output in usable_outputs if output != external for command in [off_command(output)] if command)
+        return commands
+
+    if not internal:
+        return commands
+
+    commands.append(["xrandr", "--output", internal.name, *output_enable_args(internal), "--pos", "0x0", "--primary"])
+    if mode == "duplicate":
+        commands.append(["xrandr", "--output", external.name, *output_enable_args(external), "--same-as", internal.name])
+    elif mode == "extend":
+        commands.append(["xrandr", "--output", external.name, *output_enable_args(external), "--right-of", internal.name])
+
+    active_names = {internal.name, external.name}
+    commands.extend(command for output in usable_outputs if output.name not in active_names for command in [off_command(output)] if command)
+    return commands
+
+
+def apply_commands(commands: list[list[str]], dry_run: bool) -> None:
+    if dry_run:
+        for command in commands:
+            print(" ".join(command))
+        return
+    for command in commands:
+        subprocess.run(command, check=True)
+
+
+def apply_project_mode(outputs: list[Output], mode: str, dry_run: bool) -> None:
+    commands = build_project_commands(outputs, mode, dry_run)
+    if not commands:
+        message = f"No usable output combination for display mode: {mode}"
+        if dry_run:
+            print(message)
+            return
+        raise SystemExit(message)
+    apply_commands(commands, dry_run)
+
+
+@dataclass
+class GuiOutputState:
+    output: Output
+    enabled: bool
+    x: int
+    y: int
+    width: int
+    height: int
+    mode: str
+    rotation: str
+    primary: bool
+
+    @property
+    def name(self) -> str:
+        return self.output.name
+
+    @property
+    def connected(self) -> bool:
+        return self.output.connected
+
+
+def output_default_size(output: Output) -> tuple[int, int]:
+    size = selected_output_size(output)
+    if size:
+        return size
+    return 1280, 720
+
+
+def output_default_mode(output: Output) -> str:
+    if output.current_mode:
+        return output.current_mode.name
+    if output.preferred_mode:
+        return output.preferred_mode.name
+    size = selected_output_size(output)
+    return f"{size[0]}x{size[1]}" if size else "auto"
+
+
+def output_largest_mode(output: Output) -> str:
+    sized_modes = [
+        (size[0] * size[1], mode.name)
+        for mode in output.modes
+        for size in [parse_size(mode.name)]
+        if size
+    ]
+    if sized_modes:
+        return max(sized_modes, key=lambda item: item[0])[1]
+    return output_default_mode(output)
+
+
+def create_gui_state(outputs: list[Output]) -> list[GuiOutputState]:
+    states: list[GuiOutputState] = []
+    active_outputs = [output for output in outputs if output.active]
+    right_edge = max(((output.x or 0) + (output.width or 0) for output in active_outputs), default=0)
+
+    for output in outputs:
+        if not output.connected:
+            continue
+        width, height = output_default_size(output)
+        enabled = output.active
+        x = output.x if output.x is not None else right_edge
+        y = output.y if output.y is not None else 0
+        if output.connected and not output.active:
+            right_edge += width
+
+        states.append(
+            GuiOutputState(
+                output=output,
+                enabled=enabled,
+                x=x,
+                y=y,
+                width=width,
+                height=height,
+                mode=output_default_mode(output),
+                rotation=output.rotation,
+                primary=output.primary,
+            )
+        )
+
+    if states and not any(state.primary and state.enabled for state in states):
+        first_enabled = next((state for state in states if state.enabled), None)
+        if first_enabled:
+            first_enabled.primary = True
+
+    return states
+
+
+def parse_mode_size(mode: str, fallback: tuple[int, int]) -> tuple[int, int]:
+    return parse_size(mode) or fallback
+
+
+def layout_size_for_rotation(mode: str, fallback: tuple[int, int], rotation: str) -> tuple[int, int]:
+    width, height = parse_mode_size(mode, fallback)
+    if rotation in {"left", "right"}:
+        return height, width
+    return width, height
+
+
+def normalize_enabled_positions(states: list[GuiOutputState]) -> None:
+    enabled = [state for state in states if state.enabled]
+    if not enabled:
+        return
+    min_x = min(state.x for state in enabled)
+    min_y = min(state.y for state in enabled)
+    if min_x == 0 and min_y == 0:
+        return
+    for state in enabled:
+        state.x -= min_x
+        state.y -= min_y
+
+
+def build_layout_commands(states: list[GuiOutputState], dry_run: bool = False) -> list[list[str]]:
+    commands: list[list[str]] = []
+    normalize_enabled_positions(states)
+    primary_name = next((state.name for state in states if state.enabled and state.primary), None)
+
+    for state in states:
+        if not state.connected:
+            continue
+        if state.output.simulated and not dry_run:
+            continue
+        if not state.enabled:
+            if state.output.active:
+                commands.append(["xrandr", "--output", state.name, "--off"])
+            continue
+
+        command = ["xrandr", "--output", state.name]
+        if state.mode == "auto":
+            command.append("--auto")
+        else:
+            command.extend(["--mode", state.mode])
+        command.extend(["--rotate", state.rotation, "--pos", f"{state.x}x{state.y}"])
+        if primary_name == state.name:
+            command.append("--primary")
+        commands.append(command)
+
+    return commands
+
+
+def launch_gui(outputs: list[Output], dry_run: bool) -> int:
+    try:
+        import tkinter as tk
+        from tkinter import messagebox, ttk
+    except ImportError as error:
+        raise SystemExit("Tkinter is required for --gui") from error
+
+    states = create_gui_state(outputs)
+
+    class LayoutEditor:
+        def __init__(self, root: tk.Tk) -> None:
+            self.root = root
+            self.root.title("better_randr")
+            self.root.geometry("980x620")
+            self.root.minsize(840, 520)
+            self.colors = self.detect_colors()
+            self.selected: GuiOutputState | None = next((state for state in states if state.enabled), None)
+            self.drag_state: tuple[GuiOutputState, int, int, int, int] | None = None
+            self.canvas_rects: dict[int, GuiOutputState] = {}
+            self.scale = 0.2
+            self.origin_x = 0
+            self.origin_y = 0
+
+            self.mode_var = tk.StringVar()
+            self.rotation_var = tk.StringVar()
+            self.primary_var = tk.BooleanVar()
+            self.enabled_var = tk.BooleanVar()
+            self.status_var = tk.StringVar()
+
+            self.configure_root()
+            self.build_ui(ttk)
+            self.refresh_all()
+
+        def detect_colors(self) -> dict[str, str]:
+            bg = self.root.cget("background")
+            return {
+                "bg": bg,
+                "canvas": "#20242b",
+                "grid": "#343944",
+                "monitor": "#4f8cc9",
+                "monitor_selected": "#5cc8a1",
+                "monitor_disabled": "#4a4f58",
+                "monitor_text": "#f3f5f7",
+                "primary": "#e0a84f",
+            }
+
+        def configure_root(self) -> None:
+            self.root.configure(background=self.colors["bg"])
+
+        def build_ui(self, ttk_module) -> None:
+            main = ttk_module.Frame(self.root, padding=12)
+            main.pack(fill="both", expand=True)
+            main.columnconfigure(0, weight=1)
+            main.columnconfigure(1, weight=0)
+            main.rowconfigure(0, weight=1)
+
+            canvas_frame = ttk_module.Frame(main)
+            canvas_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+            canvas_frame.rowconfigure(0, weight=1)
+            canvas_frame.columnconfigure(0, weight=1)
+
+            self.canvas = tk.Canvas(
+                canvas_frame,
+                background=self.colors["canvas"],
+                highlightthickness=1,
+                highlightbackground=self.colors["grid"],
+            )
+            self.canvas.grid(row=0, column=0, sticky="nsew")
+            self.canvas.bind("<ButtonPress-1>", self.on_canvas_press)
+            self.canvas.bind("<B1-Motion>", self.on_canvas_drag)
+            self.canvas.bind("<ButtonRelease-1>", self.on_canvas_release)
+            self.canvas.bind("<Configure>", lambda _event: self.draw_canvas())
+
+            side = ttk_module.Frame(main, width=260)
+            side.grid(row=0, column=1, sticky="ns")
+            side.grid_propagate(False)
+            side.columnconfigure(0, weight=1)
+
+            ttk_module.Label(side, text="Displays").grid(row=0, column=0, sticky="w")
+            self.output_list = tk.Listbox(side, height=9, exportselection=False)
+            self.output_list.grid(row=1, column=0, sticky="ew", pady=(4, 12))
+            self.output_list.bind("<<ListboxSelect>>", self.on_list_select)
+
+            self.enabled_check = ttk_module.Checkbutton(
+                side,
+                text="Enabled",
+                variable=self.enabled_var,
+                command=self.on_enabled_change,
+            )
+            self.enabled_check.grid(row=2, column=0, sticky="w", pady=(0, 8))
+
+            ttk_module.Label(side, text="Resolution").grid(row=3, column=0, sticky="w")
+            self.mode_combo = ttk_module.Combobox(side, textvariable=self.mode_var, state="readonly")
+            self.mode_combo.grid(row=4, column=0, sticky="ew", pady=(4, 12))
+            self.mode_combo.bind("<<ComboboxSelected>>", self.on_mode_change)
+
+            ttk_module.Label(side, text="Rotation").grid(row=5, column=0, sticky="w")
+            self.rotation_combo = ttk_module.Combobox(
+                side,
+                textvariable=self.rotation_var,
+                values=ROTATIONS,
+                state="readonly",
+            )
+            self.rotation_combo.grid(row=6, column=0, sticky="ew", pady=(4, 12))
+            self.rotation_combo.bind("<<ComboboxSelected>>", self.on_rotation_change)
+
+            self.primary_check = ttk_module.Checkbutton(
+                side,
+                text="Primary",
+                variable=self.primary_var,
+                command=self.on_primary_change,
+            )
+            self.primary_check.grid(row=7, column=0, sticky="w", pady=(0, 12))
+
+            button_row = ttk_module.Frame(side)
+            button_row.grid(row=8, column=0, sticky="ew", pady=(0, 12))
+            button_row.columnconfigure(0, weight=1)
+            button_row.columnconfigure(1, weight=1)
+            ttk_module.Button(button_row, text="Apply", command=self.apply).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+            ttk_module.Button(button_row, text="Close", command=self.root.destroy).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+
+            self.status = ttk_module.Label(side, textvariable=self.status_var, wraplength=240, justify="left")
+            self.status.grid(row=9, column=0, sticky="ew")
+
+        def enabled_states(self) -> list[GuiOutputState]:
+            return [state for state in states if state.enabled]
+
+        def state_labels(self) -> list[str]:
+            labels = []
+            for state in states:
+                if not state.connected:
+                    labels.append(f"{state.name}  disconnected")
+                elif state.enabled:
+                    suffix = " primary" if state.primary else ""
+                    labels.append(f"{state.name}  {state.mode}  {state.x},{state.y}{suffix}")
+                else:
+                    labels.append(f"{state.name}  available")
+            return labels
+
+        def refresh_all(self) -> None:
+            self.refresh_list()
+            self.refresh_controls()
+            self.draw_canvas()
+
+        def refresh_list(self) -> None:
+            selected_name = self.selected.name if self.selected else None
+            self.output_list.delete(0, tk.END)
+            selected_index = 0
+            for index, label in enumerate(self.state_labels()):
+                self.output_list.insert(tk.END, label)
+                if states[index].name == selected_name:
+                    selected_index = index
+            if states:
+                self.output_list.selection_clear(0, tk.END)
+                self.output_list.selection_set(selected_index)
+                self.output_list.activate(selected_index)
+
+        def refresh_controls(self) -> None:
+            state = self.selected
+            if not state:
+                return
+
+            modes = ["auto", *[mode.name for mode in state.output.modes]]
+            unique_modes = list(dict.fromkeys(modes))
+            self.mode_combo.configure(values=unique_modes)
+            self.mode_var.set(state.mode if state.mode in unique_modes else "auto")
+            self.rotation_var.set(state.rotation)
+            self.primary_var.set(state.primary)
+            self.enabled_var.set(state.enabled)
+            connected = "connected" if state.connected else "disconnected"
+            status = f"{state.name}: {connected}, {state.width}x{state.height}, pos {state.x},{state.y}"
+            self.status_var.set(status)
+
+            control_state = "normal" if state.connected else "disabled"
+            combo_state = "readonly" if state.connected and state.enabled else "disabled"
+            self.enabled_check.configure(state=control_state)
+            self.mode_combo.configure(state=combo_state)
+            self.rotation_combo.configure(state=combo_state)
+            self.primary_check.configure(state="normal" if state.connected and state.enabled else "disabled")
+
+        def draw_grid(self) -> None:
+            width = self.canvas.winfo_width()
+            height = self.canvas.winfo_height()
+            spacing = 40
+            for x in range(0, width, spacing):
+                self.canvas.create_line(x, 0, x, height, fill=self.colors["grid"], width=1)
+            for y in range(0, height, spacing):
+                self.canvas.create_line(0, y, width, y, fill=self.colors["grid"], width=1)
+
+        def update_viewport(self) -> None:
+            enabled = self.enabled_states()
+            if not enabled:
+                self.scale = 0.2
+                self.origin_x = 80
+                self.origin_y = 80
+                return
+
+            min_x = min(state.x for state in enabled)
+            min_y = min(state.y for state in enabled)
+            max_x = max(state.x + state.width for state in enabled)
+            max_y = max(state.y + state.height for state in enabled)
+            layout_w = max(1, max_x - min_x)
+            layout_h = max(1, max_y - min_y)
+            canvas_w = max(1, self.canvas.winfo_width() - 80)
+            canvas_h = max(1, self.canvas.winfo_height() - 80)
+            self.scale = min(canvas_w / layout_w, canvas_h / layout_h, 0.32)
+            self.origin_x = int(40 - min_x * self.scale)
+            self.origin_y = int(40 - min_y * self.scale)
+
+        def canvas_coords(self, state: GuiOutputState) -> tuple[int, int, int, int]:
+            left = int(self.origin_x + state.x * self.scale)
+            top = int(self.origin_y + state.y * self.scale)
+            right = int(left + state.width * self.scale)
+            bottom = int(top + state.height * self.scale)
+            return left, top, right, bottom
+
+        def draw_canvas(self) -> None:
+            self.canvas.delete("all")
+            self.canvas_rects.clear()
+            self.draw_grid()
+            self.update_viewport()
+
+            for state in sorted(self.enabled_states(), key=lambda item: (item.y, item.x, item.name)):
+                left, top, right, bottom = self.canvas_coords(state)
+                fill = self.colors["monitor_selected"] if state == self.selected else self.colors["monitor"]
+                rect = self.canvas.create_rectangle(left, top, right, bottom, fill=fill, outline="#ffffff", width=2)
+                self.canvas_rects[rect] = state
+                title = f"{state.name}{' *' if state.primary else ''}"
+                self.canvas.create_text(left + 10, top + 10, anchor="nw", fill=self.colors["monitor_text"], font=("TkDefaultFont", 11, "bold"), text=title)
+                details = f"{state.mode}\n{state.x},{state.y}\n{state.rotation}"
+                self.canvas.create_text(left + 10, top + 34, anchor="nw", fill=self.colors["monitor_text"], text=details)
+                if state.primary:
+                    self.canvas.create_rectangle(left + 2, top + 2, right - 2, top + 9, fill=self.colors["primary"], outline="")
+
+            if not self.enabled_states():
+                self.canvas.create_text(
+                    self.canvas.winfo_width() // 2,
+                    self.canvas.winfo_height() // 2,
+                    fill="#d4d7dd",
+                    text="Enable a connected display from the side panel.",
+                )
+
+        def state_at_canvas(self, x: int, y: int) -> GuiOutputState | None:
+            for item in reversed(self.canvas.find_overlapping(x, y, x, y)):
+                state = self.canvas_rects.get(item)
+                if state:
+                    return state
+            return None
+
+        def on_canvas_press(self, event: tk.Event) -> None:
+            state = self.state_at_canvas(event.x, event.y)
+            if not state:
+                return
+            self.selected = state
+            self.drag_state = (state, event.x, event.y, state.x, state.y)
+            self.refresh_all()
+
+        def on_canvas_drag(self, event: tk.Event) -> None:
+            if not self.drag_state:
+                return
+            state, start_x, start_y, original_x, original_y = self.drag_state
+            dx = int((event.x - start_x) / self.scale)
+            dy = int((event.y - start_y) / self.scale)
+            state.x, state.y = self.snap_position(state, original_x + dx, original_y + dy)
+            self.refresh_all()
+
+        def on_canvas_release(self, _event: tk.Event) -> None:
+            self.drag_state = None
+
+        def snap_position(self, state: GuiOutputState, x: int, y: int) -> tuple[int, int]:
+            snap = 40
+            candidates_x = [0]
+            candidates_y = [0]
+            for other in self.enabled_states():
+                if other == state:
+                    continue
+                candidates_x.extend([other.x, other.x + other.width, other.x - state.width])
+                candidates_y.extend([other.y, other.y + other.height, other.y - state.height])
+            for candidate in candidates_x:
+                if abs(x - candidate) <= snap:
+                    x = candidate
+                    break
+            for candidate in candidates_y:
+                if abs(y - candidate) <= snap:
+                    y = candidate
+                    break
+            return x, y
+
+        def on_list_select(self, _event: tk.Event) -> None:
+            selection = self.output_list.curselection()
+            if not selection:
+                return
+            self.selected = states[selection[0]]
+            self.refresh_controls()
+            self.draw_canvas()
+
+        def on_enabled_change(self) -> None:
+            state = self.selected
+            if not state or not state.connected:
+                return
+            state.enabled = self.enabled_var.get()
+            if state.enabled and not any(other.primary and other.enabled for other in states):
+                state.primary = True
+            if not state.enabled:
+                state.primary = False
+            self.refresh_all()
+
+        def on_mode_change(self, _event: tk.Event) -> None:
+            state = self.selected
+            if not state:
+                return
+            state.mode = self.mode_var.get()
+            state.width, state.height = parse_mode_size(state.mode, (state.width, state.height))
+            self.refresh_all()
+
+        def on_rotation_change(self, _event: tk.Event) -> None:
+            state = self.selected
+            if not state:
+                return
+            state.rotation = self.rotation_var.get()
+            self.refresh_all()
+
+        def on_primary_change(self) -> None:
+            state = self.selected
+            if not state or not state.enabled:
+                return
+            for other in states:
+                other.primary = other == state
+            self.refresh_all()
+
+        def apply(self) -> None:
+            commands = build_layout_commands(states, dry_run)
+            if not commands:
+                messagebox.showinfo("better_randr", "No xrandr changes to apply.")
+                return
+
+            if dry_run:
+                print("\n".join(" ".join(command) for command in commands))
+                self.status_var.set("Dry run printed commands to the terminal.")
+                return
+
+            try:
+                for command in commands:
+                    subprocess.run(command, check=True)
+            except subprocess.CalledProcessError as error:
+                messagebox.showerror("better_randr", f"Command failed: {' '.join(error.cmd)}")
+                return
+
+            self.status_var.set("Layout applied.")
+
+    root = tk.Tk()
+    LayoutEditor(root)
+    root.mainloop()
+    return 0
+
+
+def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto") -> int:
+    try:
+        import cairo
+        import gi
+
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("Gdk", "3.0")
+        from gi.repository import Gdk, Gtk, GLib
+    except (ImportError, ValueError) as error:
+        raise SystemExit(f"GTK3 and Cairo are required for --gui: {error}") from error
+
+    compositor_status = ensure_compositor(compositor)
+    states = create_gui_state(outputs)
+    edges = ("right", "below", "left", "above")
+    default_alignment = {
+        "right": "upper",
+        "left": "upper",
+        "above": "left",
+        "below": "left",
+    }
+
+    class OverlayEditor:
+        def __init__(self) -> None:
+            screen = Gdk.Screen.get_default()
+            self.focus_rect = self.focused_i3_rect()
+            self.screen_rect = self.active_screen_rect(screen.get_width(), screen.get_height())
+            self.base = self.current_display_state()
+            self.scale = 0.20
+            self.edge_index = 0
+            self.edge_alignment = dict(default_alignment)
+            self.target_index = 0
+            self.target: GuiOutputState | None = self.existing_target_for_current_placement() or self.first_available_target()
+            self.status = compositor_status or "Choose an edge, press a to attach, Enter applies."
+            self.show_help = False
+            self.closing = False
+            self.windows: list[object] = []
+            self.drawing_areas: list[object] = []
+            self.area_bases: dict[object, GuiOutputState] = {}
+
+            self.create_windows(screen)
+            GLib.timeout_add(50, self.focus_overlay)
+            GLib.timeout_add(150, self.focus_overlay)
+            GLib.timeout_add(350, self.focus_overlay)
+
+        def create_windows(self, screen: object) -> None:
+            visual = screen.get_rgba_visual()
+            for state, rect in self.overlay_window_items():
+                window_type = Gtk.WindowType.TOPLEVEL if state == self.base else Gtk.WindowType.POPUP
+                window = Gtk.Window(type=window_type)
+                window.set_title("better_randr")
+                window.set_app_paintable(True)
+                window.set_accept_focus(True)
+                window.set_focus_on_map(True)
+                window.set_decorated(False)
+                window.set_keep_above(True)
+                window.set_resizable(False)
+                window.set_skip_taskbar_hint(True)
+                window.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+                if visual:
+                    window.set_visual(visual)
+
+                drawing_area = Gtk.DrawingArea()
+                drawing_area.set_can_focus(True)
+                window.add(drawing_area)
+                self.configure_window(window, rect)
+                self.bind_window_events(window, drawing_area)
+                self.windows.append(window)
+                self.drawing_areas.append(drawing_area)
+                self.area_bases[window] = state
+                self.area_bases[drawing_area] = state
+                window.show_all()
+
+        def overlay_window_items(self) -> list[tuple[GuiOutputState, tuple[int, int, int, int]]]:
+            items = [(state, self.state_rect(state)) for state in states if state.enabled]
+            if not items:
+                raise SystemExit("No active display is available for the overlay")
+            return sorted(items, key=lambda item: item[1])
+
+        def configure_window(self, window: object, rect: tuple[int, int, int, int]) -> None:
+            screen_x, screen_y, active_w, active_h = rect
+            window.move(screen_x, screen_y)
+            window.set_default_size(active_w, active_h)
+            window.resize(active_w, active_h)
+
+        def active_screen_rect(self, fallback_w: int, fallback_h: int) -> tuple[int, int, int, int]:
+            enabled_rects = [self.state_rect(state) for state in states if state.enabled]
+            if enabled_rects:
+                min_x = min(x for x, _y, _w, _h in enabled_rects)
+                min_y = min(y for _x, y, _w, _h in enabled_rects)
+                max_x = max(x + w for x, _y, w, _h in enabled_rects)
+                max_y = max(y + h for _x, y, _w, h in enabled_rects)
+                return min_x, min_y, max_x - min_x, max_y - min_y
+
+            return 0, 0, fallback_w, fallback_h
+
+        def pointer_position(self) -> tuple[int, int]:
+            display = Gdk.Display.get_default()
+            if not display:
+                return 0, 0
+            seat = display.get_default_seat()
+            if not seat:
+                return 0, 0
+            pointer = seat.get_pointer()
+            if not pointer:
+                return 0, 0
+            _screen, x, y = pointer.get_position()
+            return x, y
+
+        def focused_i3_rect(self) -> tuple[int, int, int, int] | None:
+            if shutil.which("i3-msg") is None:
+                return None
+            try:
+                result = subprocess.run(["i3-msg", "-t", "get_workspaces"], check=True, text=True, capture_output=True)
+                workspaces = json.loads(result.stdout)
+            except (subprocess.CalledProcessError, json.JSONDecodeError):
+                return None
+
+            focused = next((workspace for workspace in workspaces if workspace.get("focused")), None)
+            if not focused:
+                return None
+            rect = focused.get("rect") or {}
+            try:
+                return int(rect["x"]), int(rect["y"]), int(rect["width"]), int(rect["height"])
+            except (KeyError, TypeError, ValueError):
+                return None
+
+        def output_rect_at(self, x: int, y: int) -> tuple[int, int, int, int] | None:
+            for state in states:
+                if not state.enabled:
+                    continue
+                rect_x, rect_y, rect_w, rect_h = self.state_rect(state)
+                if rect_x <= x < rect_x + rect_w and rect_y <= y < rect_y + rect_h:
+                    return rect_x, rect_y, rect_w, rect_h
+            return None
+
+        def state_rect(self, state: GuiOutputState) -> tuple[int, int, int, int]:
+            return state.x, state.y, state.width, state.height
+
+        def current_display_state(self) -> GuiOutputState:
+            if self.focus_rect:
+                focus_x, focus_y, focus_w, focus_h = self.focus_rect
+                for state in states:
+                    if state.enabled and (state.x, state.y, state.width, state.height) == (focus_x, focus_y, focus_w, focus_h):
+                        return state
+
+            pointer_x, pointer_y = self.pointer_position()
+            for state in states:
+                if state.enabled and state.x <= pointer_x < state.x + state.width and state.y <= pointer_y < state.y + state.height:
+                    return state
+
+            primary = next((state for state in states if state.enabled and state.primary), None)
+            if primary:
+                return primary
+            enabled = next((state for state in states if state.enabled), None)
+            if enabled:
+                return enabled
+            raise SystemExit("No active display is available for the overlay")
+
+        def bind_window_events(self, window: object, drawing_area: object) -> None:
+            window.add_events(Gdk.EventMask.KEY_PRESS_MASK | Gdk.EventMask.BUTTON_PRESS_MASK)
+            drawing_area.add_events(Gdk.EventMask.KEY_PRESS_MASK | Gdk.EventMask.BUTTON_PRESS_MASK)
+            window.connect("destroy", self.on_destroy)
+            window.connect("key-press-event", self.on_key_press)
+            window.connect("button-press-event", self.on_button_press)
+            drawing_area.connect("button-press-event", self.on_button_press)
+            drawing_area.connect("draw", self.on_draw)
+
+        def on_destroy(self, _window: object) -> None:
+            if not self.closing:
+                self.close()
+
+        def on_key_press(self, _widget: object, event: object) -> bool:
+            key = (Gdk.keyval_name(event.keyval) or "").lower()
+            shifted = bool(event.state & Gdk.ModifierType.SHIFT_MASK)
+            if key == "escape" or key == "q":
+                self.close()
+            elif key == "return":
+                self.apply_and_close()
+            elif key == "a":
+                self.attach_or_select_target()
+            elif key == "t":
+                self.cycle_placement()
+            elif key == "n" or key == "tab":
+                self.cycle_target()
+            elif shifted and key == "right":
+                self.navigate_base("right")
+            elif shifted and key == "left":
+                self.navigate_base("left")
+            elif shifted and key == "up":
+                self.navigate_base("above")
+            elif shifted and key == "down":
+                self.navigate_base("below")
+            elif key == "right":
+                self.choose_direction("right")
+            elif key == "left":
+                self.choose_direction("left")
+            elif key == "up":
+                self.choose_direction("above")
+            elif key == "down":
+                self.choose_direction("below")
+            elif key == "p":
+                self.set_current_primary()
+            elif key == "r":
+                self.rotate_target()
+            elif key == "d":
+                self.detach_target()
+            elif key == "question" or key == "?":
+                self.toggle_help()
+            else:
+                number = self.candidate_number_from_key(key)
+                if number is None:
+                    return False
+                self.select_target_number(number)
+            return True
+
+        def on_button_press(self, _widget: object, event: object) -> bool:
+            x = int(event.x)
+            y = int(event.y)
+            width, height = self.widget_size(_widget)
+            display_base = self.area_bases.get(_widget, self.base)
+            thumbnail_state = self.thumbnail_state_at(x, y, width, height, display_base)
+            if thumbnail_state:
+                self.select_target(thumbnail_state)
+                return True
+            if not self.hit_visible_item(x, y, width, height, display_base):
+                self.close()
+                return True
+            return False
+
+        def focus_overlay(self) -> bool:
+            try:
+                if self.windows:
+                    self.windows[0].present()
+                if self.drawing_areas:
+                    self.drawing_areas[0].grab_focus()
+            except Exception:
+                pass
+            return False
+
+        def redraw(self) -> None:
+            for drawing_area in self.drawing_areas:
+                drawing_area.queue_draw()
+
+        def close(self) -> None:
+            if self.closing:
+                return
+            self.closing = True
+            for window in list(self.windows):
+                window.destroy()
+            Gtk.main_quit()
+
+        def toggle_help(self) -> None:
+            self.show_help = not self.show_help
+            self.redraw()
+
+        def widget_size(self, widget: object) -> tuple[int, int]:
+            return max(1, widget.get_allocated_width()), max(1, widget.get_allocated_height())
+
+        def hit_visible_item(self, x: int, y: int, width: int, height: int, display_base: GuiOutputState) -> bool:
+            target = self.target or self.first_available_target()
+            rects = [self.canvas_overlay_base_rect(width, height, display_base)]
+            if target and display_base == self.base:
+                rects.append(self.canvas_target_rect(target, rects[0]))
+            rects.extend(rect for _state, rect in self.thumbnail_items(width, height, display_base))
+            return any(left <= x <= right and top <= y <= bottom for left, top, right, bottom in rects)
+
+        def thumbnail_state_at(self, x: int, y: int, width: int, height: int, display_base: GuiOutputState) -> GuiOutputState | None:
+            for state, rect in self.thumbnail_items(width, height, display_base):
+                left, top, right, bottom = rect
+                if left <= x <= right and top <= y <= bottom:
+                    return state
+            return None
+
+        def placement(self) -> tuple[str, str]:
+            side = edges[self.edge_index]
+            return side, self.edge_alignment[side]
+
+        def placement_position(self, target: GuiOutputState) -> tuple[int, int]:
+            side, align = self.placement()
+            x, y = self.base_edge_position(target, side, align)
+            return self.resolve_edge_position(target, x, y, side, align)
+
+        def base_edge_position(self, target: GuiOutputState, side: str, align: str) -> tuple[int, int]:
+            base = self.base
+            if side == "right":
+                y = base.y if align == "upper" else base.y + base.height - target.height
+                return base.x + base.width, y
+            if side == "left":
+                y = base.y if align == "upper" else base.y + base.height - target.height
+                return base.x - target.width, y
+            if side == "above":
+                x = base.x if align == "left" else base.x + base.width - target.width
+                return x, base.y - target.height
+            x = base.x if align == "left" else base.x + base.width - target.width
+            return x, base.y + base.height
+
+        def resolve_edge_position(self, target: GuiOutputState, x: int, y: int, side: str, align: str) -> tuple[int, int]:
+            for candidate_align in self.edge_alignments_to_try(side, align):
+                candidate_x, candidate_y = self.base_edge_position(target, side, candidate_align)
+                if not self.placement_collision(target, candidate_x, candidate_y):
+                    return candidate_x, candidate_y
+            edge_position = self.open_base_edge_position(target, side, align)
+            if edge_position:
+                return edge_position
+            return self.skip_occupied_position(target, x, y, side)
+
+        def edge_alignments_to_try(self, side: str, align: str) -> list[str]:
+            alignments = ["upper", "lower"] if side in {"left", "right"} else ["left", "right"]
+            return [align, *(candidate for candidate in alignments if candidate != align)]
+
+        def placement_collision(self, target: GuiOutputState, x: int, y: int) -> GuiOutputState | None:
+            return next(
+                (
+                    state
+                    for state in states
+                    if state != self.base
+                    and state != target
+                    and state.enabled
+                    and self.rects_overlap((x, y, target.width, target.height), (state.x, state.y, state.width, state.height))
+                ),
+                None,
+            )
+
+        def open_base_edge_position(self, target: GuiOutputState, side: str, align: str) -> tuple[int, int] | None:
+            if side in {"left", "right"}:
+                gaps = self.open_base_edge_gaps(side, self.base.y, self.base.y + self.base.height)
+                for candidate_align in self.edge_alignments_to_try(side, align):
+                    y = self.aligned_gap_position(gaps, target.height, candidate_align)
+                    if y is None:
+                        continue
+                    x = self.base.x + self.base.width if side == "right" else self.base.x - target.width
+                    if not self.placement_collision(target, x, y):
+                        return x, y
+                return None
+
+            gaps = self.open_base_edge_gaps(side, self.base.x, self.base.x + self.base.width)
+            for candidate_align in self.edge_alignments_to_try(side, align):
+                x = self.aligned_gap_position(gaps, target.width, candidate_align)
+                if x is None:
+                    continue
+                y = self.base.y - target.height if side == "above" else self.base.y + self.base.height
+                if not self.placement_collision(target, x, y):
+                    return x, y
+            return None
+
+        def open_base_edge_gaps(self, side: str, start: int, end: int) -> list[tuple[int, int]]:
+            covered = self.covered_base_edge_intervals(side, start, end)
+            if not covered:
+                return [(start, end)]
+            gaps = []
+            cursor = start
+            for interval_start, interval_end in covered:
+                if cursor < interval_start:
+                    gaps.append((cursor, interval_start))
+                cursor = max(cursor, interval_end)
+            if cursor < end:
+                gaps.append((cursor, end))
+            return gaps
+
+        def aligned_gap_position(self, gaps: list[tuple[int, int]], span: int, align: str) -> int | None:
+            if align in {"upper", "left"}:
+                ordered_gaps = gaps
+            else:
+                ordered_gaps = list(reversed(gaps))
+            for start, end in ordered_gaps:
+                if end - start >= span:
+                    return start if align in {"upper", "left"} else end - span
+                return end - span if align in {"upper", "left"} else start
+            return None
+
+        def covered_base_edge_intervals(self, side: str, start: int, end: int) -> list[tuple[int, int]]:
+            intervals = []
+            for state in states:
+                if state == self.base or not state.enabled:
+                    continue
+                interval = self.base_edge_interval_for_state(state, side, start, end)
+                if interval:
+                    intervals.append(interval)
+            return self.merge_intervals(intervals)
+
+        def base_edge_interval_for_state(self, state: GuiOutputState, side: str, start: int, end: int) -> tuple[int, int] | None:
+            base = self.base
+            if side == "right" and state.x == base.x + base.width:
+                return self.clamped_interval(state.y, state.y + state.height, start, end)
+            if side == "left" and state.x + state.width == base.x:
+                return self.clamped_interval(state.y, state.y + state.height, start, end)
+            if side == "above" and state.y + state.height == base.y:
+                return self.clamped_interval(state.x, state.x + state.width, start, end)
+            if side == "below" and state.y == base.y + base.height:
+                return self.clamped_interval(state.x, state.x + state.width, start, end)
+            return None
+
+        def clamped_interval(self, start: int, end: int, lower: int, upper: int) -> tuple[int, int] | None:
+            clamped_start = max(start, lower)
+            clamped_end = min(end, upper)
+            if clamped_start >= clamped_end:
+                return None
+            return clamped_start, clamped_end
+
+        def merge_intervals(self, intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+            if not intervals:
+                return []
+            sorted_intervals = sorted(intervals)
+            merged = [sorted_intervals[0]]
+            for start, end in sorted_intervals[1:]:
+                previous_start, previous_end = merged[-1]
+                if start <= previous_end:
+                    merged[-1] = previous_start, max(previous_end, end)
+                else:
+                    merged.append((start, end))
+            return merged
+
+        def skip_occupied_position(self, target: GuiOutputState, x: int, y: int, side: str) -> tuple[int, int]:
+            for _attempt in range(len(states)):
+                collision = self.placement_collision(target, x, y)
+                if not collision:
+                    return x, y
+                if side == "right":
+                    x = collision.x + collision.width
+                elif side == "left":
+                    x = collision.x - target.width
+                elif side == "above":
+                    y = collision.y - target.height
+                else:
+                    y = collision.y + collision.height
+            return x, y
+
+        def rects_overlap(self, first: tuple[int, int, int, int], second: tuple[int, int, int, int]) -> bool:
+            first_x, first_y, first_w, first_h = first
+            second_x, second_y, second_w, second_h = second
+            return (
+                first_x < second_x + second_w
+                and first_x + first_w > second_x
+                and first_y < second_y + second_h
+                and first_y + first_h > second_y
+            )
+
+        def existing_target_for_current_placement(self) -> GuiOutputState | None:
+            for state in states:
+                if state == self.base or not state.enabled:
+                    continue
+                if (state.x, state.y) == self.placement_position(state):
+                    return state
+            return None
+
+        def first_available_target(self) -> GuiOutputState | None:
+            return next((state for state in states if state != self.base and not state.enabled), None) or next(
+                (state for state in states if state != self.base and state.enabled),
+                None,
+            )
+
+        def candidates(self, base: GuiOutputState | None = None) -> list[GuiOutputState]:
+            base = base or self.base
+            return [state for state in states if state != base]
+
+        def navigate_base(self, side: str) -> None:
+            next_base = self.monitor_in_direction(side)
+            if not next_base:
+                self.status = f"No attached monitor {side} of {self.base.name}."
+                self.redraw()
+                return
+            self.base = next_base
+            if self.target == self.base:
+                self.target = self.first_available_target()
+            candidates = self.candidates()
+            self.target_index = candidates.index(self.target) if self.target in candidates else 0
+            self.status = f"Current monitor: {self.base.name}."
+            self.redraw()
+
+        def monitor_in_direction(self, side: str) -> GuiOutputState | None:
+            base_center_x, base_center_y = self.monitor_center(self.base)
+            directional: list[tuple[int, int, GuiOutputState]] = []
+            for state in states:
+                if state == self.base or not state.enabled:
+                    continue
+                center_x, center_y = self.monitor_center(state)
+                if side == "right" and center_x <= base_center_x:
+                    continue
+                if side == "left" and center_x >= base_center_x:
+                    continue
+                if side == "above" and center_y >= base_center_y:
+                    continue
+                if side == "below" and center_y <= base_center_y:
+                    continue
+                primary_distance = abs(center_x - base_center_x) if side in {"left", "right"} else abs(center_y - base_center_y)
+                secondary_distance = abs(center_y - base_center_y) if side in {"left", "right"} else abs(center_x - base_center_x)
+                directional.append((primary_distance, secondary_distance, state))
+            if not directional:
+                return None
+            return min(directional, key=lambda item: (item[0], item[1]))[2]
+
+        def monitor_center(self, state: GuiOutputState) -> tuple[int, int]:
+            return state.x + (state.width // 2), state.y + (state.height // 2)
+
+        def cycle_target(self) -> None:
+            candidates = self.candidates()
+            if not candidates:
+                self.status = "No connected monitor is available to attach."
+                self.redraw()
+                return
+            if self.target in candidates:
+                self.target_index = candidates.index(self.target)
+            self.target_index = (self.target_index + 1) % len(candidates)
+            self.target = candidates[self.target_index]
+            self.move_enabled_target_to_placement()
+            self.status = f"Candidate: {self.target.name}."
+            self.redraw()
+
+        def candidate_number_from_key(self, key: str) -> int | None:
+            if key.isdigit() and key != "0":
+                return int(key)
+            if key.startswith("kp_") and key[3:].isdigit() and key[3:] != "0":
+                return int(key[3:])
+            return None
+
+        def select_target_number(self, number: int) -> None:
+            candidates = self.candidates()
+            index = number - 1
+            if index < 0 or index >= len(candidates):
+                self.status = f"No candidate monitor at {number}."
+                self.redraw()
+                return
+            self.select_target(candidates[index])
+
+        def select_target(self, target: GuiOutputState) -> None:
+            candidates = self.candidates()
+            if target not in candidates:
+                return
+            self.target = target
+            self.target_index = candidates.index(target)
+            self.move_enabled_target_to_placement()
+            self.status = f"Candidate: {target.name}."
+            self.redraw()
+
+        def set_target_largest_mode(self, target: GuiOutputState) -> None:
+            target.mode = output_largest_mode(target.output)
+            target.width, target.height = layout_size_for_rotation(target.mode, (target.width, target.height), target.rotation)
+
+        def rotate_target(self) -> None:
+            self.target = self.target or self.existing_target_for_current_placement() or self.first_available_target()
+            if not self.target:
+                self.status = "No connected monitor is available to rotate."
+                self.redraw()
+                return
+            current_index = ROTATION_CYCLE.index(self.target.rotation) if self.target.rotation in ROTATION_CYCLE else 0
+            self.target.rotation = ROTATION_CYCLE[(current_index + 1) % len(ROTATION_CYCLE)]
+            self.target.width, self.target.height = layout_size_for_rotation(
+                self.target.mode,
+                (self.target.width, self.target.height),
+                self.target.rotation,
+            )
+            self.move_enabled_target_to_placement()
+            self.status = f"{self.target.name} rotation: {self.target.rotation}."
+            self.redraw()
+
+        def cycle_placement(self) -> None:
+            self.edge_index = (self.edge_index + 1) % len(edges)
+            self.target = self.target or self.existing_target_for_current_placement() or self.first_available_target()
+            self.move_enabled_target_to_placement()
+            self.status = f"Placement: {self.placement_label()}."
+            self.redraw()
+
+        def choose_direction(self, side: str) -> None:
+            if edges[self.edge_index] == side:
+                self.toggle_alignment(side)
+            else:
+                self.edge_index = edges.index(side)
+            self.target = self.target or self.existing_target_for_current_placement() or self.first_available_target()
+            self.move_enabled_target_to_placement()
+            self.status = f"Placement: {self.placement_label()}."
+            self.redraw()
+
+        def toggle_alignment(self, side: str) -> None:
+            if side in {"left", "right"}:
+                self.edge_alignment[side] = "lower" if self.edge_alignment[side] == "upper" else "upper"
+            else:
+                self.edge_alignment[side] = "right" if self.edge_alignment[side] == "left" else "left"
+
+        def move_enabled_target_to_placement(self) -> None:
+            if self.target and self.target.enabled:
+                self.target.x, self.target.y = self.placement_position(self.target)
+
+        def attach_or_select_target(self) -> None:
+            self.target = self.target or self.existing_target_for_current_placement() or self.first_available_target()
+            if not self.target:
+                self.status = "No connected monitor is available to attach."
+                self.redraw()
+                return
+            candidates = self.candidates()
+            if self.target in candidates:
+                self.target_index = candidates.index(self.target)
+            self.set_target_largest_mode(self.target)
+            self.target.enabled = True
+            self.target.primary = False
+            self.target.x, self.target.y = self.placement_position(self.target)
+            normalize_enabled_positions(states)
+            self.status = f"{self.target.name} attached at {self.placement_label()}."
+            self.redraw()
+
+        def detach_target(self) -> None:
+            if self.target and self.target != self.base:
+                self.target.enabled = False
+                self.target.primary = False
+                if not any(state.enabled and state.primary for state in states):
+                    self.base.primary = True
+                self.status = f"{self.target.name} detached."
+                self.redraw()
+
+        def set_current_primary(self) -> None:
+            selected = self.base
+            for state in states:
+                state.primary = state == selected
+            self.status = f"{selected.name} set as primary."
+            self.redraw()
+
+        def placement_label(self) -> str:
+            side, align = self.placement()
+            return f"{side} / {align}"
+
+        def canvas_base_rect(self, width: int, height: int, target: GuiOutputState | None) -> tuple[int, int, int, int]:
+            available_w = max(1, width * 0.42)
+            available_h = max(1, height * 0.44)
+            self.scale = min(available_w / self.base.width, available_h / self.base.height, 0.24)
+            base_w = int(self.base.width * self.scale)
+            base_h = int(self.base.height * self.scale)
+            left = (width - base_w) // 2
+            top = max(70, (height - base_h) // 2 - 36)
+            return left, top, left + base_w, top + base_h
+
+        def canvas_display_rect(
+            self,
+            state: GuiOutputState,
+            display_base: GuiOutputState,
+            base_rect: tuple[int, int, int, int],
+        ) -> tuple[int, int, int, int]:
+            base_left, base_top, _base_right, _base_bottom = base_rect
+            width = max(90, int(state.width * self.scale))
+            height = max(58, int(state.height * self.scale))
+            left = int(base_left + ((state.x - display_base.x) * self.scale))
+            top = int(base_top + ((state.y - display_base.y) * self.scale))
+            return left, top, left + width, top + height
+
+        def canvas_target_rect(self, target: GuiOutputState, base_rect: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+            if target.enabled:
+                return self.canvas_state_rect(target, base_rect)
+
+            base_left, base_top, _base_right, _base_bottom = base_rect
+            target_x, target_y = self.placement_position(target)
+            target_w = max(90, int(target.width * self.scale))
+            target_h = max(58, int(target.height * self.scale))
+            left = int(base_left + ((target_x - self.base.x) * self.scale))
+            top = int(base_top + ((target_y - self.base.y) * self.scale))
+            return left, top, left + target_w, top + target_h
+
+        def canvas_state_rect(self, state: GuiOutputState, base_rect: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+            base_left, base_top, _base_right, _base_bottom = base_rect
+            width = max(90, int(state.width * self.scale))
+            height = max(58, int(state.height * self.scale))
+            left = int(base_left + ((state.x - self.base.x) * self.scale))
+            top = int(base_top + ((state.y - self.base.y) * self.scale))
+            return left, top, left + width, top + height
+
+        def on_draw(self, _widget: object, cr: object) -> bool:
+            width, height = self.widget_size(_widget)
+            cr.set_operator(cairo.OPERATOR_SOURCE)
+            cr.set_source_rgba(0, 0, 0, 0)
+            cr.paint()
+            cr.set_operator(cairo.OPERATOR_OVER)
+
+            target = self.target or self.first_available_target()
+            display_base = self.area_bases.get(_widget, self.base)
+            perspective_alpha = 1.0 if display_base == self.base else 0.42
+            base_rect = self.canvas_overlay_base_rect(width, height, display_base)
+            if display_base == self.base:
+                self.draw_monitor(cr, self.base, base_rect, "#3f8fd2", "#f2f4f8", "current")
+                self.draw_selected_edge(cr, base_rect)
+                self.draw_placed_monitors(cr, target, base_rect, display_base)
+
+                if target:
+                    target_rect = self.canvas_target_rect(target, base_rect)
+                    fill = "#55bfa3" if target.enabled else "#222936"
+                    outline = "#55bfa3" if target.enabled else "#e0a84f"
+                    self.draw_monitor(cr, target, target_rect, fill, outline, "attached" if target.enabled else "available")
+                else:
+                    side, align = self.placement()
+                    self.draw_text(cr, width // 2, height // 2, f"No monitor available for {side} / {align}", "#e0a84f", 12, anchor="center")
+            else:
+                self.draw_monitor(cr, display_base, base_rect, "#374151", "#7d8796", "attached", alpha=perspective_alpha)
+                self.draw_placed_monitors(cr, None, base_rect, display_base, perspective_alpha)
+
+            self.draw_candidate_thumbnails(cr, target, width, height, display_base, perspective_alpha)
+            if self.show_help:
+                self.draw_help_panel(cr, height)
+            return False
+
+        def canvas_overlay_base_rect(self, width: int, height: int, display_base: GuiOutputState) -> tuple[int, int, int, int]:
+            available_w = max(1, width * 0.50)
+            available_h = max(1, height * 0.50)
+            self.scale = min(available_w / display_base.width, available_h / display_base.height, 0.24)
+            monitor_w = int(display_base.width * self.scale)
+            monitor_h = int(display_base.height * self.scale)
+            left = (width - monitor_w) // 2
+            top = max(70, (height - monitor_h) // 2 - 36)
+            return left, top, left + monitor_w, top + monitor_h
+
+        def draw_placed_monitors(
+            self,
+            cr: object,
+            target: GuiOutputState | None,
+            base_rect: tuple[int, int, int, int],
+            display_base: GuiOutputState,
+            perspective_alpha: float = 1.0,
+        ) -> None:
+            for state in states:
+                if state == display_base or state == target or not state.enabled:
+                    continue
+                rect = self.canvas_display_rect(state, display_base, base_rect)
+                fill = "#3f8fd2" if state == self.base else "#374151"
+                outline = "#f2f4f8" if state == self.base else "#7d8796"
+                label = "current" if state == self.base else "placed"
+                monitor_alpha = perspective_alpha if state == self.base else min(perspective_alpha, 0.50)
+                self.draw_monitor(cr, state, rect, fill, outline, label, alpha=monitor_alpha)
+
+        def draw_monitor(
+            self,
+            cr: object,
+            state: GuiOutputState,
+            rect: tuple[int, int, int, int],
+            fill: str,
+            outline: str,
+            label: str,
+            alpha: float = 1.0,
+        ) -> None:
+            left, top, right, bottom = rect
+            self.draw_rectangle(cr, left, top, right, bottom, fill, outline, 3, fill_alpha=alpha, outline_alpha=alpha)
+            self.draw_text(cr, left + 14, top + 16, state.name, "#ffffff", 13, bold=True, alpha=alpha)
+            text = f"{label}  {state.mode}  {state.width}x{state.height}  rot {state.rotation}"
+            if state.output.simulated:
+                text += "  simulated"
+            self.draw_text(cr, left + 14, top + 43, text, "#edf1f5", 10, alpha=alpha)
+            if state.rotation != "normal":
+                badge_w = min(62, max(34, (right - left) - 28))
+                badge_left = right - badge_w - 12
+                if badge_left > left + 12:
+                    self.draw_orientation_badge(cr, badge_left, bottom - 33, right - 12, bottom - 12, state.rotation, alpha)
+            if state.primary:
+                badge_w = min(74, max(34, (right - left) - 28))
+                badge_left = right - badge_w - 12
+                if badge_left > left + 12:
+                    self.draw_primary_badge(cr, badge_left, top + 12, right - 12, top + 33, alpha)
+
+        def draw_orientation_badge(
+            self,
+            cr: object,
+            left: int,
+            top: int,
+            right: int,
+            bottom: int,
+            rotation: str,
+            alpha: float = 1.0,
+        ) -> None:
+            if right - left < 34:
+                return
+            self.draw_rectangle(cr, left, top, right, bottom, "#4fd1c5", "#4fd1c5", 1, fill_alpha=alpha, outline_alpha=alpha)
+            self.draw_text(cr, (left + right) // 2, (top + bottom) // 2, rotation.upper(), "#0b1220", 8, bold=True, anchor="center", alpha=alpha)
+
+        def draw_primary_badge(self, cr: object, left: int, top: int, right: int, bottom: int, alpha: float = 1.0) -> None:
+            if right - left < 34:
+                return
+            self.draw_rectangle(cr, left, top, right, bottom, "#e0a84f", "#e0a84f", 1, fill_alpha=alpha, outline_alpha=alpha)
+            self.draw_text(cr, (left + right) // 2, (top + bottom) // 2, "PRIMARY", "#111827", 8, bold=True, anchor="center", alpha=alpha)
+
+        def candidate_display_size(self, state: GuiOutputState) -> tuple[int, int]:
+            mode = output_largest_mode(state.output)
+            return layout_size_for_rotation(mode, (state.width, state.height), state.rotation)
+
+        def thumbnail_items(
+            self,
+            width: int,
+            height: int,
+            display_base: GuiOutputState | None = None,
+        ) -> list[tuple[GuiOutputState, tuple[int, int, int, int]]]:
+            candidates = self.candidates(display_base)
+            if not candidates:
+                return []
+
+            sizes = [self.candidate_display_size(state) for state in candidates]
+            max_source_w = max(source_w for source_w, _source_h in sizes)
+            max_source_h = max(source_h for _source_w, source_h in sizes)
+            gap = 14
+            max_thumb_w = 132
+            max_thumb_h = 74
+            scale = min(max_thumb_w / max_source_w, max_thumb_h / max_source_h)
+            thumb_sizes = [
+                (max(50, int(source_w * scale)), max(34, int(source_h * scale))) for source_w, source_h in sizes
+            ]
+            total_w = sum(thumb_w for thumb_w, _thumb_h in thumb_sizes) + (gap * (len(candidates) - 1))
+            if total_w > width - 48:
+                fit_scale = max(0.45, (width - 48 - (gap * (len(candidates) - 1))) / max(1, sum(thumb_w for thumb_w, _thumb_h in thumb_sizes)))
+                thumb_sizes = [(max(40, int(thumb_w * fit_scale)), max(28, int(thumb_h * fit_scale))) for thumb_w, thumb_h in thumb_sizes]
+                total_w = sum(thumb_w for thumb_w, _thumb_h in thumb_sizes) + (gap * (len(candidates) - 1))
+
+            x = max(24, (width - total_w) // 2)
+            row_h = max(thumb_h for _thumb_w, thumb_h in thumb_sizes)
+            y = max(24, height - row_h - 36)
+            items = []
+            for state, (thumb_w, thumb_h) in zip(candidates, thumb_sizes):
+                top = y + ((row_h - thumb_h) // 2)
+                items.append((state, (x, top, x + thumb_w, top + thumb_h)))
+                x += thumb_w + gap
+            return items
+
+        def draw_candidate_thumbnails(
+            self,
+            cr: object,
+            target: GuiOutputState | None,
+            width: int,
+            height: int,
+            display_base: GuiOutputState,
+            perspective_alpha: float = 1.0,
+        ) -> None:
+            for index, (state, rect) in enumerate(self.thumbnail_items(width, height, display_base), start=1):
+                left, top, right, bottom = rect
+                if state == self.base:
+                    fill = "#2f7fbd"
+                    outline = "#f2f4f8"
+                    fill_alpha = 1.0
+                elif state.enabled:
+                    fill = "#2f3744"
+                    outline = "#7d8796"
+                    fill_alpha = 0.50
+                else:
+                    fill = "#222936"
+                    outline = "#e0a84f" if state == target else "#6d7787"
+                    fill_alpha = 1.0
+                alpha = min(fill_alpha, perspective_alpha)
+                line_width = 4 if state.enabled else 3 if state == target else 2
+                self.draw_rectangle(cr, left, top, right, bottom, fill, outline, line_width, fill_alpha=alpha, outline_alpha=alpha)
+                if state == target:
+                    self.draw_rectangle(cr, left + 5, top + 5, right - 5, bottom - 5, fill, "#e0a84f", 2, fill_alpha=alpha, outline_alpha=alpha)
+                self.draw_text(cr, left + 8, top + 8, str(index), "#e0a84f", 9, bold=True, alpha=alpha)
+                self.draw_text(cr, left + 22, top + 8, state.name, "#ffffff", 9, bold=True, alpha=alpha)
+                if state.primary:
+                    self.draw_primary_thumbnail_badge(cr, right - 22, top + 6, right - 6, top + 22, alpha)
+                status = "placed" if state.enabled else "available"
+                if state.output.simulated:
+                    status = f"{status} sim"
+                if state.rotation != "normal":
+                    status = f"{status} rot {state.rotation}"
+                source_w, source_h = self.candidate_display_size(state)
+                self.draw_text(cr, left + 8, bottom - 20, f"{source_w}x{source_h}", "#d6dbe4", 8, alpha=alpha)
+                self.draw_text(cr, left + 8, bottom - 9, status, "#d6dbe4", 7, alpha=alpha)
+
+        def draw_selected_edge(self, cr: object, rect: tuple[int, int, int, int]) -> None:
+            left, top, right, bottom = rect
+            side, _align = self.placement()
+            self.set_color(cr, "#e0a84f")
+            cr.set_line_width(7)
+            if side == "right":
+                cr.move_to(right, top)
+                cr.line_to(right, bottom)
+            elif side == "left":
+                cr.move_to(left, top)
+                cr.line_to(left, bottom)
+            elif side == "above":
+                cr.move_to(left, top)
+                cr.line_to(right, top)
+            else:
+                cr.move_to(left, bottom)
+                cr.line_to(right, bottom)
+            cr.stroke()
+
+        def help_rows(self) -> list[tuple[str, str]]:
+            return [
+                ("a", "Attach or move the selected monitor to the highlighted edge"),
+                ("1-9", "Select the numbered available monitor"),
+                ("n / Tab", "Cycle the selected available monitor"),
+                ("t", "Cycle the highlighted edge"),
+                ("r", "Rotate the selected monitor"),
+                ("Arrow keys", "Choose an edge; press the same arrow again to flip alignment"),
+                ("Shift+Arrows", "Switch the current monitor to an attached monitor"),
+                ("p", "Make the current perspective monitor primary"),
+                ("d", "Detach the selected monitor"),
+                ("Enter", "Apply the layout"),
+                ("Esc / q", "Cancel"),
+                ("?", "Hide this panel"),
+            ]
+
+        def draw_help_panel(self, cr: object, height: int) -> None:
+            left = 18
+            row_h = 24
+            panel_w = 620
+            panel_h = 112 + (len(self.help_rows()) * row_h)
+            top = max(18, height - panel_h - 22)
+            self.draw_translucent_rectangle(cr, left, top, left + panel_w, top + panel_h, "#0b0f14", 0.82, "#8d98aa", 0.82, 1)
+
+            text_left = left + 18
+            key_left = left + 22
+            action_left = left + 142
+            y = top + 18
+            self.draw_text(cr, text_left, y, "better-randr hotkeys", "#f2f4f8", 13, bold=True)
+            y += 28
+            self.draw_text(cr, text_left, y, self.status, "#d6dbe4", 10)
+            y += 22
+            self.draw_text(cr, text_left, y, f"Selected edge: {self.placement_label()}", "#d6dbe4", 10)
+            y += 30
+
+            for key, action in self.help_rows():
+                self.draw_key_label(cr, key_left, y - 3, key)
+                self.draw_text(cr, action_left, y, action, "#cbd2dd", 10)
+                y += row_h
+
+        def draw_key_label(self, cr: object, x: int, y: int, label: str) -> None:
+            label_w = max(44, int(len(label) * 8.5) + 18)
+            self.draw_translucent_rectangle(cr, x, y, x + label_w, y + 18, "#1f2937", 0.92, "#e0a84f", 0.90, 1)
+            self.draw_text(cr, x + 9, y + 3, label, "#f2f4f8", 9, bold=True)
+
+        def draw_primary_thumbnail_badge(self, cr: object, left: int, top: int, right: int, bottom: int, alpha: float = 1.0) -> None:
+            self.draw_rectangle(cr, left, top, right, bottom, "#e0a84f", "#e0a84f", 1, fill_alpha=alpha, outline_alpha=alpha)
+            self.draw_text(cr, (left + right) // 2, (top + bottom) // 2, "P", "#111827", 8, bold=True, anchor="center", alpha=alpha)
+
+        def draw_translucent_rectangle(
+            self,
+            cr: object,
+            left: int,
+            top: int,
+            right: int,
+            bottom: int,
+            fill: str,
+            fill_alpha: float,
+            outline: str,
+            outline_alpha: float,
+            line_width: int,
+        ) -> None:
+            cr.rectangle(left, top, right - left, bottom - top)
+            self.set_color(cr, fill, fill_alpha)
+            cr.fill_preserve()
+            self.set_color(cr, outline, outline_alpha)
+            cr.set_line_width(line_width)
+            cr.stroke()
+
+        def draw_rectangle(
+            self,
+            cr: object,
+            left: int,
+            top: int,
+            right: int,
+            bottom: int,
+            fill: str,
+            outline: str,
+            line_width: int,
+            fill_alpha: float = 1.0,
+            outline_alpha: float = 1.0,
+        ) -> None:
+            cr.rectangle(left, top, right - left, bottom - top)
+            self.set_color(cr, fill, fill_alpha)
+            cr.fill_preserve()
+            self.set_color(cr, outline, outline_alpha)
+            cr.set_line_width(line_width)
+            cr.stroke()
+
+        def draw_text(
+            self,
+            cr: object,
+            x: int,
+            y: int,
+            text: str,
+            color: str,
+            size: int,
+            bold: bool = False,
+            anchor: str = "nw",
+            alpha: float = 1.0,
+        ) -> None:
+            cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD if bold else cairo.FONT_WEIGHT_NORMAL)
+            cr.set_font_size(size)
+            extents = cr.text_extents(text)
+            draw_x = x
+            draw_y = y - extents.y_bearing
+            if anchor == "center":
+                draw_x = x - (extents.width / 2 + extents.x_bearing)
+                draw_y = y - (extents.height / 2 + extents.y_bearing)
+            self.set_color(cr, color, alpha)
+            cr.move_to(draw_x, draw_y)
+            cr.show_text(text)
+
+        def set_color(self, cr: object, color: str, alpha: float = 1.0) -> None:
+            color = color.lstrip("#")
+            red = int(color[0:2], 16) / 255
+            green = int(color[2:4], 16) / 255
+            blue = int(color[4:6], 16) / 255
+            cr.set_source_rgba(red, green, blue, alpha)
+
+        def apply_and_close(self) -> None:
+            commands = build_layout_commands(states, dry_run)
+            if not commands:
+                self.status = "No changes to apply."
+                self.redraw()
+                return
+            if dry_run:
+                print("\n".join(" ".join(command) for command in commands))
+                self.close()
+                return
+            try:
+                for command in commands:
+                    subprocess.run(command, check=True)
+            except subprocess.CalledProcessError as error:
+                self.status = f"Failed: {' '.join(error.cmd)}"
+                self.redraw()
+                return
+            self.close()
+
+    Gtk.init([])
+    OverlayEditor()
+    Gtk.main()
+    return 0
+
+
+def enable_output(output: Output, outputs: list[Output], dry_run: bool) -> None:
+    mode = select_mode(output)
+    if not mode:
+        return
+
+    command = ["xrandr", "--output", output.name]
+    if mode == "auto":
+        command.append("--auto")
+    else:
+        command.extend(["--mode", mode])
+
+    size = selected_output_size(output, mode)
+    if size:
+        placement_args = select_placement_args(output, outputs, size)
+        if placement_args:
+            command.extend(placement_args)
+
+    run_command(command, dry_run)
+
+
+def move_output(output: Output, outputs: list[Output], dry_run: bool) -> None:
+    size = selected_output_size(output)
+    if not size:
+        return
+
+    placement_args = select_placement_args(output, outputs, size)
+    if not placement_args:
+        return
+
+    run_command(
+        ["xrandr", "--output", output.name, *placement_args],
+        dry_run,
+    )
+
+
+def set_mode(output: Output, dry_run: bool) -> None:
+    mode = select_mode(output)
+    if not mode:
+        return
+
+    command = ["xrandr", "--output", output.name]
+    if mode == "auto":
+        command.append("--auto")
+    else:
+        command.extend(["--mode", mode])
+    run_command(command, dry_run)
+
+
+def rotate_output(output: Output, outputs: list[Output], dry_run: bool) -> None:
+    rotation = select_rotation(output, outputs)
+    if not rotation:
+        return
+
+    run_command(["xrandr", "--output", output.name, "--rotate", rotation], dry_run)
+
+
+def handle_action(output: Output, outputs: list[Output], action: str, dry_run: bool) -> None:
+    if action == "enable":
+        enable_output(output, outputs, dry_run)
+    elif action == "move / align":
+        move_output(output, outputs, dry_run)
+    elif action == "set resolution":
+        set_mode(output, dry_run)
+    elif action == "rotate":
+        rotate_output(output, outputs, dry_run)
+    elif action == "set primary":
+        run_command(["xrandr", "--output", output.name, "--primary"], dry_run)
+    elif action == "disable":
+        run_command(["xrandr", "--output", output.name, "--off"], dry_run)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Rofi-driven xrandr monitor manager")
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="open the transparent overlay layout editor directly",
+    )
+    parser.add_argument(
+        "--compositor",
+        choices=COMPOSITOR_MODES,
+        default="auto",
+        help="for --gui, start picom/xcompmgr if needed for transparent overlay background",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the xrandr command that would run after menu selection",
+    )
+    parser.add_argument(
+        "--print-layout",
+        action="store_true",
+        help="print the parsed monitor layout and exit without opening rofi",
+    )
+    parser.add_argument(
+        "--project",
+        choices=("menu", *PROJECT_MODES),
+        help="open the display-mode menu or apply a Windows-style display mode directly",
+    )
+    parser.add_argument(
+        "--simulate-monitor",
+        action="append",
+        default=[],
+        metavar="NAME[:WIDTHxHEIGHT[+X+Y|@right]]",
+        nargs="?",
+        const="SIM-1:1920x1080",
+        help="add a fake connected monitor; include +X+Y to start it attached",
+    )
+    parser.add_argument(
+        "--simulate-layout",
+        action="append",
+        choices=SIMULATED_LAYOUTS,
+        default=[],
+        help="add a preset fake monitor layout for interface testing",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    require_binary("xrandr")
+    needs_rofi = not args.gui and (args.project is None or args.project == "menu") and not args.print_layout
+    if needs_rofi:
+        require_binary("rofi")
+
+    outputs = parse_xrandr(xrandr_query())
+    for simulated_layout in args.simulate_layout:
+        add_simulated_layout(outputs, simulated_layout)
+    for simulated_monitor in args.simulate_monitor:
+        add_simulated_monitor(outputs, simulated_monitor)
+
+    if args.print_layout:
+        print(plain_markup(layout_message(outputs)))
+        return 0
+
+    if args.project:
+        if args.project == "menu":
+            require_binary("rofi")
+            mode = select_project_mode(outputs)
+            if not mode:
+                return 0
+            if mode == "gui":
+                return launch_overlay(outputs, args.dry_run, args.compositor)
+            if mode == "monitor-actions":
+                output = select_output(outputs)
+                if not output:
+                    return 0
+                action = select_action(output, outputs)
+                if action:
+                    handle_action(output, outputs, action, args.dry_run)
+                return 0
+            apply_project_mode(outputs, mode, args.dry_run)
+            return 0
+
+        apply_project_mode(outputs, args.project, args.dry_run)
+        return 0
+
+    if args.gui:
+        return launch_overlay(outputs, args.dry_run, args.compositor)
+
+    start_action = select_start_action(outputs)
+    if not start_action:
+        return 0
+    if start_action == "gui":
+        return launch_overlay(outputs, args.dry_run, args.compositor)
+    if isinstance(start_action, str) and start_action in PROJECT_MODES:
+        apply_project_mode(outputs, start_action, args.dry_run)
+        return 0
+
+    output = start_action
+
+    action = select_action(output, outputs)
+    if not action:
+        return 0
+
+    handle_action(output, outputs, action, args.dry_run)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except subprocess.CalledProcessError as error:
+        print(f"Command failed with exit code {error.returncode}: {' '.join(error.cmd)}", file=sys.stderr)
+        raise SystemExit(error.returncode)
