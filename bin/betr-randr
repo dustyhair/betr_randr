@@ -929,6 +929,60 @@ def normalize_enabled_positions(states: list[GuiOutputState]) -> None:
         state.y -= min_y
 
 
+def rect_overlap_area(first: tuple[int, int, int, int], second: tuple[int, int, int, int]) -> int:
+    first_x, first_y, first_w, first_h = first
+    second_x, second_y, second_w, second_h = second
+    overlap_w = max(0, min(first_x + first_w, second_x + second_w) - max(first_x, second_x))
+    overlap_h = max(0, min(first_y + first_h, second_y + second_h) - max(first_y, second_y))
+    return overlap_w * overlap_h
+
+
+def focused_state_from_i3(
+    states: list[GuiOutputState],
+    output_name: str | None,
+    rect: tuple[int, int, int, int] | None,
+) -> GuiOutputState | None:
+    if output_name:
+        matched = next((state for state in states if state.enabled and state.name == output_name), None)
+        if matched:
+            return matched
+
+    if not rect:
+        return None
+
+    scored = [
+        (rect_overlap_area((state.x, state.y, state.width, state.height), rect), state)
+        for state in states
+        if state.enabled
+    ]
+    scored = [item for item in scored if item[0] > 0]
+    if not scored:
+        return None
+    return max(scored, key=lambda item: item[0])[1]
+
+
+def i3_workspace_rect(workspace: dict[object, object]) -> tuple[int, int, int, int] | None:
+    rect = workspace.get("rect")
+    if not isinstance(rect, dict):
+        return None
+    try:
+        return int(rect["x"]), int(rect["y"]), int(rect["width"]), int(rect["height"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def visible_i3_output_rects(workspaces: list[dict[object, object]]) -> dict[str, tuple[int, int, int, int]]:
+    rects: dict[str, tuple[int, int, int, int]] = {}
+    for workspace in workspaces:
+        output_name = workspace.get("output")
+        if not workspace.get("visible") or not isinstance(output_name, str):
+            continue
+        rect = i3_workspace_rect(workspace)
+        if rect:
+            rects[output_name] = rect
+    return rects
+
+
 def build_layout_commands(states: list[GuiOutputState], dry_run: bool = False) -> list[list[str]]:
     commands: list[list[str]] = []
     normalize_enabled_positions(states)
@@ -1356,7 +1410,9 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
     class OverlayEditor:
         def __init__(self) -> None:
             screen = Gdk.Screen.get_default()
-            self.focus_rect = self.focused_i3_rect()
+            self.i3_workspaces = self.read_i3_workspaces()
+            self.focus_output_name, self.focus_rect = self.focused_i3_context(self.i3_workspaces)
+            self.i3_output_rects = visible_i3_output_rects(self.i3_workspaces)
             self.screen_rect = self.active_screen_rect(screen.get_width(), screen.get_height())
             self.base = self.current_display_state()
             self.scale = 0.20
@@ -1392,8 +1448,10 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
                 window.set_focus_on_map(True)
                 window.set_decorated(False)
                 window.set_keep_above(True)
+                window.stick()
                 window.set_resizable(False)
                 window.set_skip_taskbar_hint(True)
+                window.set_skip_pager_hint(True)
                 window.set_type_hint(Gdk.WindowTypeHint.DIALOG)
                 if visual:
                     window.set_visual(visual)
@@ -1409,9 +1467,10 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
                 self.area_bases[drawing_area] = state
                 self.window_bases.append((window, state))
                 window.show_all()
+                self.make_window_follow_workspaces(window)
 
         def overlay_window_items(self) -> list[tuple[GuiOutputState, tuple[int, int, int, int]]]:
-            items = [(state, self.state_rect(state)) for state in states if state.enabled]
+            items = [(state, self.overlay_rect(state)) for state in states if state.enabled]
             if not items:
                 raise SystemExit("No active display is available for the overlay")
             return sorted(items, key=lambda item: item[1])
@@ -1421,6 +1480,30 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
             window.move(screen_x, screen_y)
             window.set_default_size(active_w, active_h)
             window.resize(active_w, active_h)
+
+        def make_window_follow_workspaces(self, window: object) -> None:
+            try:
+                window.stick()
+            except Exception:
+                pass
+            self.enable_i3_sticky(window)
+
+        def enable_i3_sticky(self, window: object) -> None:
+            if shutil.which("i3-msg") is None:
+                return
+            try:
+                gdk_window = window.get_window()
+                if not gdk_window or not hasattr(gdk_window, "get_xid"):
+                    return
+                xid = gdk_window.get_xid()
+                subprocess.run(
+                    ["i3-msg", f'[id="{xid}"] sticky enable'],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                pass
 
         def active_screen_rect(self, fallback_w: int, fallback_h: int) -> tuple[int, int, int, int]:
             enabled_rects = [self.state_rect(state) for state in states if state.enabled]
@@ -1446,23 +1529,29 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
             _screen, x, y = pointer.get_position()
             return x, y
 
-        def focused_i3_rect(self) -> tuple[int, int, int, int] | None:
+        def read_i3_workspaces(self) -> list[dict[object, object]]:
             if shutil.which("i3-msg") is None:
-                return None
+                return []
             try:
                 result = subprocess.run(["i3-msg", "-t", "get_workspaces"], check=True, text=True, capture_output=True)
-                workspaces = json.loads(result.stdout)
+                payload = json.loads(result.stdout)
             except (subprocess.CalledProcessError, json.JSONDecodeError):
-                return None
+                return []
+            if not isinstance(payload, list):
+                return []
+            return [workspace for workspace in payload if isinstance(workspace, dict)]
 
+        def focused_i3_context(
+            self,
+            workspaces: list[dict[object, object]],
+        ) -> tuple[str | None, tuple[int, int, int, int] | None]:
             focused = next((workspace for workspace in workspaces if workspace.get("focused")), None)
             if not focused:
-                return None
-            rect = focused.get("rect") or {}
-            try:
-                return int(rect["x"]), int(rect["y"]), int(rect["width"]), int(rect["height"])
-            except (KeyError, TypeError, ValueError):
-                return None
+                return None, None
+
+            output_name = focused.get("output")
+            output_name = output_name if isinstance(output_name, str) else None
+            return output_name, i3_workspace_rect(focused)
 
         def output_rect_at(self, x: int, y: int) -> tuple[int, int, int, int] | None:
             for state in states:
@@ -1476,12 +1565,13 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
         def state_rect(self, state: GuiOutputState) -> tuple[int, int, int, int]:
             return state.x, state.y, state.width, state.height
 
+        def overlay_rect(self, state: GuiOutputState) -> tuple[int, int, int, int]:
+            return self.i3_output_rects.get(state.name, self.state_rect(state))
+
         def current_display_state(self) -> GuiOutputState:
-            if self.focus_rect:
-                focus_x, focus_y, focus_w, focus_h = self.focus_rect
-                for state in states:
-                    if state.enabled and (state.x, state.y, state.width, state.height) == (focus_x, focus_y, focus_w, focus_h):
-                        return state
+            focused_state = focused_state_from_i3(states, self.focus_output_name, self.focus_rect)
+            if focused_state:
+                return focused_state
 
             pointer_x, pointer_y = self.pointer_position()
             for state in states:
@@ -1609,13 +1699,15 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
                 self.redraw()
             return True
 
-        def on_pointer_viewport_event(self, widget: object, _event: object) -> bool:
+        def on_pointer_viewport_event(self, widget: object, event: object) -> bool:
             self.activate_viewport_for_widget(widget)
+            self.select_hover_target(widget, event)
             return False
 
         def on_motion_notify(self, widget: object, event: object) -> bool:
             if not self.drag_target:
                 self.activate_viewport_for_widget(widget)
+                self.select_hover_target(widget, event)
             if not self.drag_target or not self.drag_target.connected:
                 return False
             width, height = self.widget_size(widget)
@@ -1637,6 +1729,20 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
                 return
             self.drag_target = target
             self.drag_started = False
+
+        def select_hover_target(self, widget: object, event: object) -> None:
+            if self.drag_target or not hasattr(event, "x") or not hasattr(event, "y"):
+                return
+            x = int(event.x)
+            y = int(event.y)
+            width, height = self.widget_size(widget)
+            display_base = self.area_bases.get(widget, self.base)
+            hovered = self.thumbnail_state_at(x, y, width, height, display_base)
+            if not hovered:
+                hovered = self.monitor_state_at(x, y, width, height, display_base)
+            if not hovered or hovered == self.base or hovered == self.target:
+                return
+            self.select_target(hovered)
 
         def activate_viewport_for_widget(self, widget: object, update_status: bool = True) -> None:
             if self.drag_target:
@@ -2558,7 +2664,7 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
                 ("n / Tab", "Cycle the selected available monitor"),
                 ("t", "Cycle the highlighted edge"),
                 ("r", "Rotate the selected monitor"),
-                ("Mouse", "Click a monitor to select it; drag it to place on an edge"),
+                ("Mouse", "Hover/click a monitor to select it; drag it to place on an edge"),
                 ("Arrow keys", "Choose an edge; press the same arrow again to flip alignment"),
                 ("Shift+Arrows", "Switch the current monitor to an attached monitor"),
                 ("p", "Make the current perspective monitor primary"),

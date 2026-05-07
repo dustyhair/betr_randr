@@ -117,8 +117,10 @@ visible across the attached layout in i3. The current monitor gets the focused
 control window; the other monitors use unmanaged popup overlays so i3 does not
 move them back to the launching output. Each attached monitor window shows that
 monitor from its own perspective, including neighboring attached monitors in
-their relative positions; the selected current display also shows the monitor
-being attached or moved at the selected edge/corner. It lets you:
+their relative positions. Overlay windows are marked sticky so they follow
+workspace changes while the tool is open; the selected current display also
+starts from i3's focused output when available, then shows the monitor being
+attached or moved at the selected edge/corner. It lets you:
 
 - attach an available connected monitor at its largest supported resolution
 - see every available connected monitor as a scaled thumbnail centered along
@@ -137,8 +139,8 @@ being attached or moved at the selected edge/corner. It lets you:
   each monitor's largest reported mode for relative size
 - click a thumbnail, press its number, or press `n`/`Tab` to choose the attach
   candidate
-- click a monitor preview to select it, or drag a connected monitor preview to
-  stage it on the nearest edge/alignment of the current monitor
+- hover or click a monitor preview to select it, or drag a connected monitor
+  preview to stage it on the nearest edge/alignment of the current monitor
 - move the mouse to another attached monitor's overlay to make that monitor the
   current editing perspective
 - rotate the selected candidate monitor before attaching or while moving it
@@ -161,8 +163,8 @@ Overlay controls:
 - `n` or `Tab`: cycle the candidate monitor
 - `t`: cycle the selected border
 - `r`: rotate the candidate monitor
-- Mouse click/drag: select a monitor preview, then drag it to place it on the
-  nearest edge/alignment
+- Mouse hover/click/drag: select a monitor preview, then drag it to place it on
+  the nearest edge/alignment
 - Arrow keys: choose a border. Press the same arrow again to toggle that
   border's alignment end.
 - `Shift` + Arrow keys: switch the current display to an attached monitor in

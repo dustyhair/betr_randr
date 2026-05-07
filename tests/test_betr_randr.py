@@ -307,6 +307,100 @@ HDMI-A-0 disconnected
         self.assertIn(["xrandr", "--output", "HDMI-A-0", "--off"], commands)
 
 
+class I3FocusSelectionTests(unittest.TestCase):
+    def test_focused_state_prefers_i3_output_name(self):
+        br = load_module()
+        states = br.create_gui_state(
+            [
+                br.Output(
+                    name="eDP",
+                    connected=True,
+                    primary=True,
+                    geometry="1920x1200+0+0",
+                    width=1920,
+                    height=1200,
+                    x=0,
+                    y=0,
+                    modes=[br.Mode("1920x1200", current=True, preferred=True)],
+                ),
+                br.Output(
+                    name="DisplayPort-6",
+                    connected=True,
+                    geometry="3840x2160+1920+0",
+                    width=3840,
+                    height=2160,
+                    x=1920,
+                    y=0,
+                    modes=[br.Mode("3840x2160", current=True, preferred=True)],
+                ),
+            ]
+        )
+
+        focused = br.focused_state_from_i3(states, "DisplayPort-6", (0, 0, 1920, 1200))
+
+        self.assertEqual("DisplayPort-6", focused.name)
+
+    def test_focused_state_uses_largest_overlap_when_rect_is_not_exact(self):
+        br = load_module()
+        states = br.create_gui_state(
+            [
+                br.Output(
+                    name="eDP",
+                    connected=True,
+                    primary=True,
+                    geometry="1920x1200+0+0",
+                    width=1920,
+                    height=1200,
+                    x=0,
+                    y=0,
+                    modes=[br.Mode("1920x1200", current=True, preferred=True)],
+                ),
+                br.Output(
+                    name="DisplayPort-6",
+                    connected=True,
+                    geometry="3840x2160+1920+0",
+                    width=3840,
+                    height=2160,
+                    x=1920,
+                    y=0,
+                    modes=[br.Mode("3840x2160", current=True, preferred=True)],
+                ),
+            ]
+        )
+
+        focused = br.focused_state_from_i3(states, None, (1920, 24, 3840, 2136))
+
+        self.assertEqual("DisplayPort-6", focused.name)
+
+    def test_visible_i3_output_rects_uses_visible_workspace_viewports(self):
+        br = load_module()
+        workspaces = [
+            {
+                "focused": True,
+                "visible": True,
+                "output": "eDP",
+                "rect": {"x": 10, "y": 10, "width": 1900, "height": 1155},
+            },
+            {
+                "focused": False,
+                "visible": True,
+                "output": "DisplayPort-6",
+                "rect": {"x": 1930, "y": 10, "width": 3820, "height": 2115},
+            },
+            {
+                "focused": False,
+                "visible": False,
+                "output": "DisplayPort-6",
+                "rect": {"x": 1920, "y": 0, "width": 3840, "height": 2160},
+            },
+        ]
+
+        rects = br.visible_i3_output_rects(workspaces)
+
+        self.assertEqual((10, 10, 1900, 1155), rects["eDP"])
+        self.assertEqual((1930, 10, 3820, 2115), rects["DisplayPort-6"])
+
+
 class ProjectModeCommandTests(unittest.TestCase):
     def test_extend_places_external_to_the_right(self):
         br = load_module()
