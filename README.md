@@ -137,6 +137,10 @@ being attached or moved at the selected edge/corner. It lets you:
   each monitor's largest reported mode for relative size
 - click a thumbnail, press its number, or press `n`/`Tab` to choose the attach
   candidate
+- click a monitor preview to select it, or drag a connected monitor preview to
+  stage it on the nearest edge/alignment of the current monitor
+- move the mouse to another attached monitor's overlay to make that monitor the
+  current editing perspective
 - rotate the selected candidate monitor before attaching or while moving it
 - use `Shift`+arrow keys to switch the current display to another attached
   monitor
@@ -157,10 +161,13 @@ Overlay controls:
 - `n` or `Tab`: cycle the candidate monitor
 - `t`: cycle the selected border
 - `r`: rotate the candidate monitor
+- Mouse click/drag: select a monitor preview, then drag it to place it on the
+  nearest edge/alignment
 - Arrow keys: choose a border. Press the same arrow again to toggle that
   border's alignment end.
 - `Shift` + Arrow keys: switch the current display to an attached monitor in
   that direction
+- Mouse over another overlay: switch the current display to that monitor
 - `p`: make the current perspective monitor primary, regardless of which
   candidate monitor is selected for placement.
 - `d`: detach the candidate monitor

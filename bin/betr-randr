@@ -1372,6 +1372,9 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
             self.windows: list[object] = []
             self.drawing_areas: list[object] = []
             self.area_bases: dict[object, GuiOutputState] = {}
+            self.window_bases: list[tuple[object, GuiOutputState]] = []
+            self.drag_target: GuiOutputState | None = None
+            self.drag_started = False
 
             self.create_windows(screen)
             GLib.timeout_add(50, self.focus_overlay)
@@ -1404,6 +1407,7 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
                 self.drawing_areas.append(drawing_area)
                 self.area_bases[window] = state
                 self.area_bases[drawing_area] = state
+                self.window_bases.append((window, state))
                 window.show_all()
 
         def overlay_window_items(self) -> list[tuple[GuiOutputState, tuple[int, int, int, int]]]:
@@ -1493,12 +1497,25 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
             raise SystemExit("No active display is available for the overlay")
 
         def bind_window_events(self, window: object, drawing_area: object) -> None:
-            window.add_events(Gdk.EventMask.KEY_PRESS_MASK | Gdk.EventMask.BUTTON_PRESS_MASK)
-            drawing_area.add_events(Gdk.EventMask.KEY_PRESS_MASK | Gdk.EventMask.BUTTON_PRESS_MASK)
+            event_mask = (
+                Gdk.EventMask.KEY_PRESS_MASK
+                | Gdk.EventMask.BUTTON_PRESS_MASK
+                | Gdk.EventMask.BUTTON_RELEASE_MASK
+                | Gdk.EventMask.ENTER_NOTIFY_MASK
+                | Gdk.EventMask.POINTER_MOTION_MASK
+            )
+            window.add_events(event_mask)
+            drawing_area.add_events(event_mask)
             window.connect("destroy", self.on_destroy)
             window.connect("key-press-event", self.on_key_press)
             window.connect("button-press-event", self.on_button_press)
+            window.connect("button-release-event", self.on_button_release)
+            window.connect("enter-notify-event", self.on_pointer_viewport_event)
+            window.connect("motion-notify-event", self.on_motion_notify)
             drawing_area.connect("button-press-event", self.on_button_press)
+            drawing_area.connect("button-release-event", self.on_button_release)
+            drawing_area.connect("enter-notify-event", self.on_pointer_viewport_event)
+            drawing_area.connect("motion-notify-event", self.on_motion_notify)
             drawing_area.connect("draw", self.on_draw)
 
         def on_destroy(self, _window: object) -> None:
@@ -1550,25 +1567,106 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
             return True
 
         def on_button_press(self, _widget: object, event: object) -> bool:
+            self.activate_viewport_for_widget(_widget, update_status=False)
             x = int(event.x)
             y = int(event.y)
             width, height = self.widget_size(_widget)
             display_base = self.area_bases.get(_widget, self.base)
+            if getattr(event, "button", 1) != 1:
+                return False
             thumbnail_state = self.thumbnail_state_at(x, y, width, height, display_base)
             if thumbnail_state:
                 self.select_target(thumbnail_state)
+                self.begin_drag(thumbnail_state)
+                return True
+            monitor_state = self.monitor_state_at(x, y, width, height, display_base)
+            if monitor_state:
+                if monitor_state == self.base:
+                    base_rect = self.canvas_overlay_base_rect(width, height, display_base, self.target)
+                    self.choose_placement_from_canvas_point(x, y, base_rect)
+                    self.status = f"Placement: {self.placement_label()}."
+                    self.redraw()
+                else:
+                    self.select_target(monitor_state)
+                    self.begin_drag(monitor_state)
                 return True
             if not self.hit_visible_item(x, y, width, height, display_base):
                 self.close()
                 return True
             return False
 
+        def on_button_release(self, _widget: object, _event: object) -> bool:
+            if not self.drag_target:
+                return False
+            target = self.drag_target
+            dragged = self.drag_started
+            self.drag_target = None
+            self.drag_started = False
+            if dragged and target.connected:
+                self.stage_target_at_placement(target)
+                normalize_enabled_positions(states)
+                self.status = f"{target.name} staged at {self.placement_label()}."
+                self.redraw()
+            return True
+
+        def on_pointer_viewport_event(self, widget: object, _event: object) -> bool:
+            self.activate_viewport_for_widget(widget)
+            return False
+
+        def on_motion_notify(self, widget: object, event: object) -> bool:
+            if not self.drag_target:
+                self.activate_viewport_for_widget(widget)
+            if not self.drag_target or not self.drag_target.connected:
+                return False
+            width, height = self.widget_size(widget)
+            display_base = self.area_bases.get(widget, self.base)
+            if display_base != self.base:
+                return False
+            base_rect = self.canvas_overlay_base_rect(width, height, display_base, self.drag_target)
+            self.choose_placement_from_canvas_point(int(event.x), int(event.y), base_rect)
+            self.drag_started = True
+            self.stage_target_at_placement(self.drag_target)
+            self.status = f"Dragging {self.drag_target.name}: {self.placement_label()}."
+            self.redraw()
+            return True
+
+        def begin_drag(self, target: GuiOutputState) -> None:
+            if target == self.base or not target.connected:
+                self.drag_target = None
+                self.drag_started = False
+                return
+            self.drag_target = target
+            self.drag_started = False
+
+        def activate_viewport_for_widget(self, widget: object, update_status: bool = True) -> None:
+            if self.drag_target:
+                return
+            display_base = self.area_bases.get(widget)
+            if not display_base or display_base == self.base or not display_base.enabled:
+                return
+            self.activate_base(display_base, "mouse", update_status)
+
+        def activate_base(self, next_base: GuiOutputState, source: str, update_status: bool = True) -> None:
+            if next_base == self.base or not next_base.enabled:
+                return
+            self.base = next_base
+            if self.target == self.base:
+                self.target = self.first_available_target()
+            candidates = self.candidates()
+            self.target_index = candidates.index(self.target) if self.target in candidates else 0
+            if update_status:
+                action = "Mouse viewport" if source == "mouse" else "Current monitor"
+                self.status = f"{action}: {self.base.name}."
+            self.redraw()
+
         def focus_overlay(self) -> bool:
             try:
-                if self.windows:
-                    self.windows[0].present()
-                if self.drawing_areas:
-                    self.drawing_areas[0].grab_focus()
+                active_window = next((window for window, state in self.window_bases if state == self.base), None)
+                active_area = next((area for area in self.drawing_areas if self.area_bases.get(area) == self.base), None)
+                if active_window:
+                    active_window.present()
+                if active_area:
+                    active_area.grab_focus()
             except Exception:
                 pass
             return False
@@ -1607,9 +1705,50 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
                     return state
             return None
 
+        def monitor_state_at(
+            self,
+            x: int,
+            y: int,
+            width: int,
+            height: int,
+            display_base: GuiOutputState,
+        ) -> GuiOutputState | None:
+            target = self.target or (self.first_available_target() if self.show_default_target else None)
+            base_rect = self.canvas_overlay_base_rect(width, height, display_base, target)
+            items: list[tuple[GuiOutputState, tuple[int, int, int, int]]] = [(display_base, base_rect)]
+            for state in states:
+                unavailable_placeholder = not state.connected and state.position_known
+                if state == display_base or state == target or (not state.enabled and not unavailable_placeholder):
+                    continue
+                items.append((state, self.canvas_display_rect(state, display_base, base_rect)))
+            if target and display_base == self.base:
+                if not target.connected and target.position_known:
+                    items.append((target, self.canvas_display_rect(target, display_base, base_rect)))
+                else:
+                    items.append((target, self.canvas_target_rect(target, base_rect)))
+            for state, rect in reversed(items):
+                left, top, right, bottom = rect
+                if left <= x <= right and top <= y <= bottom:
+                    return state
+            return None
+
         def placement(self) -> tuple[str, str]:
             side = edges[self.edge_index]
             return side, self.edge_alignment[side]
+
+        def choose_placement_from_canvas_point(self, x: int, y: int, base_rect: tuple[int, int, int, int]) -> None:
+            left, top, right, bottom = base_rect
+            center_x = (left + right) / 2
+            center_y = (top + bottom) / 2
+            horizontal_distance = abs(x - center_x) / max(1, right - left)
+            vertical_distance = abs(y - center_y) / max(1, bottom - top)
+            if horizontal_distance >= vertical_distance:
+                side = "right" if x >= center_x else "left"
+                self.edge_alignment[side] = "upper" if y < center_y else "lower"
+            else:
+                side = "below" if y >= center_y else "above"
+                self.edge_alignment[side] = "left" if x < center_x else "right"
+            self.edge_index = edges.index(side)
 
         def placement_position(self, target: GuiOutputState) -> tuple[int, int]:
             side, align = self.placement()
@@ -1801,13 +1940,7 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
                 self.status = f"No attached monitor {side} of {self.base.name}."
                 self.redraw()
                 return
-            self.base = next_base
-            if self.target == self.base:
-                self.target = self.first_available_target()
-            candidates = self.candidates()
-            self.target_index = candidates.index(self.target) if self.target in candidates else 0
-            self.status = f"Current monitor: {self.base.name}."
-            self.redraw()
+            self.activate_base(next_base, "keyboard")
 
         def monitor_in_direction(self, side: str) -> GuiOutputState | None:
             base_center_x, base_center_y = self.monitor_center(self.base)
@@ -1938,6 +2071,18 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
             if self.target and self.target.enabled:
                 self.target.x, self.target.y = self.placement_position(self.target)
 
+        def stage_target_at_placement(self, target: GuiOutputState) -> None:
+            if target == self.base or not target.connected:
+                return
+            self.target = target
+            self.show_default_target = True
+            candidates = self.candidates()
+            self.target_index = candidates.index(target) if target in candidates else 0
+            self.set_target_largest_mode(target)
+            target.enabled = True
+            target.primary = False
+            target.x, target.y = self.placement_position(target)
+
         def attach_or_select_target(self) -> None:
             self.target = self.target or self.existing_target_for_current_placement() or self.first_available_target()
             if not self.target:
@@ -1951,10 +2096,7 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
             candidates = self.candidates()
             if self.target in candidates:
                 self.target_index = candidates.index(self.target)
-            self.set_target_largest_mode(self.target)
-            self.target.enabled = True
-            self.target.primary = False
-            self.target.x, self.target.y = self.placement_position(self.target)
+            self.stage_target_at_placement(self.target)
             normalize_enabled_positions(states)
             self.status = f"{self.target.name} attached at {self.placement_label()}."
             self.redraw()
@@ -2416,6 +2558,7 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
                 ("n / Tab", "Cycle the selected available monitor"),
                 ("t", "Cycle the highlighted edge"),
                 ("r", "Rotate the selected monitor"),
+                ("Mouse", "Click a monitor to select it; drag it to place on an edge"),
                 ("Arrow keys", "Choose an edge; press the same arrow again to flip alignment"),
                 ("Shift+Arrows", "Switch the current monitor to an attached monitor"),
                 ("p", "Make the current perspective monitor primary"),
