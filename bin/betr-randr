@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import importlib.util
 import json
 import os
 import re
@@ -54,6 +55,97 @@ textbox {
   font: "monospace 10";
 }
 """
+
+
+def clamp_color_channel(value: float) -> int:
+    return max(0, min(255, int(round(value))))
+
+
+def hex_to_rgb(color: str) -> tuple[int, int, int]:
+    color = color.lstrip("#")
+    return int(color[0:2], 16), int(color[2:4], 16), int(color[4:6], 16)
+
+
+def rgb_to_hex(red: int, green: int, blue: int) -> str:
+    return f"#{clamp_color_channel(red):02x}{clamp_color_channel(green):02x}{clamp_color_channel(blue):02x}"
+
+
+def mix_color(first: str, second: str, second_weight: float) -> str:
+    first_rgb = hex_to_rgb(first)
+    second_rgb = hex_to_rgb(second)
+    first_weight = 1.0 - second_weight
+    return rgb_to_hex(
+        (first_rgb[0] * first_weight) + (second_rgb[0] * second_weight),
+        (first_rgb[1] * first_weight) + (second_rgb[1] * second_weight),
+        (first_rgb[2] * first_weight) + (second_rgb[2] * second_weight),
+    )
+
+
+def color_luminance(color: str) -> float:
+    red, green, blue = (channel / 255 for channel in hex_to_rgb(color))
+    return (0.2126 * red) + (0.7152 * green) + (0.0722 * blue)
+
+
+def readable_text_color(color: str) -> str:
+    return "#111827" if color_luminance(color) > 0.58 else "#f8fafc"
+
+
+def overlay_palette(background: str, foreground: str, accent: str) -> dict[str, str]:
+    dark = color_luminance(background) < 0.5
+    toward = "#ffffff" if dark else "#000000"
+    away = "#000000" if dark else "#ffffff"
+    primary = "#e0a84f" if dark else "#9a6700"
+    orientation = "#4fd1c5" if dark else "#007a72"
+    disconnected = mix_color(background, foreground, 0.34)
+    return {
+        "current_fill": mix_color(accent, background, 0.10),
+        "current_outline": mix_color(foreground, accent, 0.12),
+        "placed_fill": mix_color(background, foreground, 0.18),
+        "placed_outline": mix_color(background, foreground, 0.52),
+        "attached_fill": mix_color(accent, foreground, 0.22),
+        "available_fill": mix_color(background, away, 0.10),
+        "target_outline": primary,
+        "disconnected_fill": disconnected,
+        "disconnected_outline": mix_color(disconnected, foreground, 0.45),
+        "text": foreground,
+        "text_dim": mix_color(foreground, background, 0.24),
+        "panel_bg": mix_color(background, away, 0.16),
+        "panel_outline": mix_color(foreground, background, 0.42),
+        "key_bg": mix_color(background, toward, 0.12),
+        "primary": primary,
+        "primary_text": readable_text_color(primary),
+        "orientation": orientation,
+        "orientation_text": readable_text_color(orientation),
+        "warning_text": primary,
+    }
+
+
+def python_module_available(name: str) -> bool:
+    return importlib.util.find_spec(name) is not None
+
+
+def dependency_statuses() -> list[tuple[str, str, bool, bool]]:
+    compositor_available = shutil.which("picom") is not None or shutil.which("xcompmgr") is not None
+    return [
+        ("xrandr", "required for display query/apply", True, shutil.which("xrandr") is not None),
+        ("rofi", "required for menu mode", True, shutil.which("rofi") is not None),
+        ("python gi", "required for --gui GTK overlay", True, python_module_available("gi")),
+        ("python cairo", "required for --gui drawing", True, python_module_available("cairo")),
+        ("picom or xcompmgr", "optional compositor for transparent overlay", False, compositor_available),
+        ("xprop", "optional compositor detection", False, shutil.which("xprop") is not None),
+        ("i3-msg", "optional focused-workspace detection in i3", False, shutil.which("i3-msg") is not None),
+    ]
+
+
+def print_dependency_check() -> int:
+    missing_required = False
+    for name, purpose, required, available in dependency_statuses():
+        marker = "ok" if available else "missing"
+        requirement = "required" if required else "optional"
+        print(f"{marker:7} {name:18} {requirement}  {purpose}")
+        if required and not available:
+            missing_required = True
+    return 1 if missing_required else 0
 
 
 @dataclass
@@ -365,7 +457,7 @@ def rofi_choose(prompt: str, choices: Iterable[str], message: str | None = None)
     ]
     if message:
         command.extend(["-mesg", message])
-    theme_str = os.environ.get("BETTER_RANDR_ROFI_THEME_STR", DEFAULT_ROFI_THEME_STR)
+    theme_str = os.environ.get("BETR_RANDR_ROFI_THEME_STR", DEFAULT_ROFI_THEME_STR)
     if theme_str:
         command.extend(["-theme-str", theme_str])
 
@@ -489,7 +581,7 @@ def select_start_action(outputs: list[Output]) -> str | Output | None:
     labels: dict[str, str | Output] = {project_mode_label(mode): mode for mode in PROJECT_MODES}
     labels[f"{strong('advanced placement overlay')}  {dim('keyboard attach and edge placement')}"] = "gui"
     labels.update({output_label(output): output for output in outputs if output.connected})
-    selected = rofi_choose("better-randr", labels.keys(), layout_message(outputs))
+    selected = rofi_choose("betr-randr", labels.keys(), layout_message(outputs))
     return labels.get(selected) if selected else None
 
 
@@ -879,7 +971,7 @@ def launch_gui(outputs: list[Output], dry_run: bool) -> int:
     class LayoutEditor:
         def __init__(self, root: tk.Tk) -> None:
             self.root = root
-            self.root.title("better_randr")
+            self.root.title("betr_randr")
             self.root.geometry("980x620")
             self.root.minsize(840, 520)
             self.colors = self.detect_colors()
@@ -1200,7 +1292,7 @@ def launch_gui(outputs: list[Output], dry_run: bool) -> int:
         def apply(self) -> None:
             commands = build_layout_commands(states, dry_run)
             if not commands:
-                messagebox.showinfo("better_randr", "No xrandr changes to apply.")
+                messagebox.showinfo("betr_randr", "No xrandr changes to apply.")
                 return
 
             if dry_run:
@@ -1212,7 +1304,7 @@ def launch_gui(outputs: list[Output], dry_run: bool) -> int:
                 for command in commands:
                     subprocess.run(command, check=True)
             except subprocess.CalledProcessError as error:
-                messagebox.showerror("better_randr", f"Command failed: {' '.join(error.cmd)}")
+                messagebox.showerror("betr_randr", f"Command failed: {' '.join(error.cmd)}")
                 return
 
             self.status_var.set("Layout applied.")
@@ -1234,6 +1326,7 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
     except (ImportError, ValueError) as error:
         raise SystemExit(f"GTK3 and Cairo are required for --gui: {error}") from error
 
+    Gtk.init([])
     compositor_status = ensure_compositor(compositor)
     states = create_gui_state(outputs)
     edges = ("right", "below", "left", "above")
@@ -1243,6 +1336,22 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
         "above": "left",
         "below": "left",
     }
+
+    def gtk_rgba_to_hex(rgba: object) -> str:
+        return rgb_to_hex(rgba.red * 255, rgba.green * 255, rgba.blue * 255)
+
+    def gtk_named_color(style: object, name: str, fallback: str) -> str:
+        found, rgba = style.lookup_color(name)
+        return gtk_rgba_to_hex(rgba) if found else fallback
+
+    def gtk_overlay_palette() -> dict[str, str]:
+        probe = Gtk.Window()
+        style = probe.get_style_context()
+        background = gtk_named_color(style, "theme_bg_color", "#111827")
+        foreground = gtk_named_color(style, "theme_fg_color", "#f8fafc")
+        accent = gtk_named_color(style, "theme_selected_bg_color", "#3f8fd2")
+        probe.destroy()
+        return overlay_palette(background, foreground, accent)
 
     class OverlayEditor:
         def __init__(self) -> None:
@@ -1259,6 +1368,7 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
             self.status = compositor_status or "Choose an edge, press a to attach, Enter applies."
             self.show_help = False
             self.closing = False
+            self.colors = gtk_overlay_palette()
             self.windows: list[object] = []
             self.drawing_areas: list[object] = []
             self.area_bases: dict[object, GuiOutputState] = {}
@@ -1273,7 +1383,7 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
             for state, rect in self.overlay_window_items():
                 window_type = Gtk.WindowType.TOPLEVEL if state == self.base else Gtk.WindowType.POPUP
                 window = Gtk.Window(type=window_type)
-                window.set_title("better_randr")
+                window.set_title("betr_randr")
                 window.set_app_paintable(True)
                 window.set_accept_focus(True)
                 window.set_focus_on_map(True)
@@ -1930,24 +2040,48 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
             perspective_alpha = 1.0 if display_base == self.base else 0.42
             base_rect = self.canvas_overlay_base_rect(width, height, display_base, target)
             if display_base == self.base:
-                self.draw_monitor(cr, self.base, base_rect, "#3f8fd2", "#f2f4f8", "current")
+                self.draw_monitor(cr, self.base, base_rect, self.colors["current_fill"], self.colors["current_outline"], "current")
                 self.draw_selected_edge(cr, base_rect)
                 self.draw_placed_monitors(cr, target, base_rect, display_base)
 
                 if target:
                     if not target.connected and target.position_known:
                         target_rect = self.canvas_display_rect(target, display_base, base_rect)
-                        self.draw_monitor(cr, target, target_rect, "#4b5563", "#d1d5db", "disconnected", alpha=0.86)
+                        self.draw_monitor(
+                            cr,
+                            target,
+                            target_rect,
+                            self.colors["disconnected_fill"],
+                            self.colors["disconnected_outline"],
+                            "disconnected",
+                            alpha=0.86,
+                        )
                     else:
                         target_rect = self.canvas_target_rect(target, base_rect)
-                        fill = "#55bfa3" if target.enabled else "#222936"
-                        outline = "#55bfa3" if target.enabled else "#e0a84f"
+                        fill = self.colors["attached_fill"] if target.enabled else self.colors["available_fill"]
+                        outline = self.colors["attached_fill"] if target.enabled else self.colors["target_outline"]
                         self.draw_monitor(cr, target, target_rect, fill, outline, "attached" if target.enabled else "available")
                 else:
                     side, align = self.placement()
-                    self.draw_text(cr, width // 2, height // 2, f"No monitor available for {side} / {align}", "#e0a84f", 12, anchor="center")
+                    self.draw_text(
+                        cr,
+                        width // 2,
+                        height // 2,
+                        f"No monitor available for {side} / {align}",
+                        self.colors["warning_text"],
+                        12,
+                        anchor="center",
+                    )
             else:
-                self.draw_monitor(cr, display_base, base_rect, "#374151", "#7d8796", "attached", alpha=perspective_alpha)
+                self.draw_monitor(
+                    cr,
+                    display_base,
+                    base_rect,
+                    self.colors["placed_fill"],
+                    self.colors["placed_outline"],
+                    "attached",
+                    alpha=perspective_alpha,
+                )
                 self.draw_placed_monitors(cr, None, base_rect, display_base, perspective_alpha)
 
             self.draw_candidate_thumbnails(cr, target, width, height, display_base, perspective_alpha)
@@ -2022,13 +2156,13 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
                     continue
                 rect = self.canvas_display_rect(state, display_base, base_rect)
                 if unavailable_placeholder:
-                    fill = "#4b5563"
-                    outline = "#c2cad6"
+                    fill = self.colors["disconnected_fill"]
+                    outline = self.colors["disconnected_outline"]
                     label = "disconnected"
                     monitor_alpha = min(perspective_alpha, 0.72)
                 else:
-                    fill = "#3f8fd2" if state == self.base else "#374151"
-                    outline = "#f2f4f8" if state == self.base else "#7d8796"
+                    fill = self.colors["current_fill"] if state == self.base else self.colors["placed_fill"]
+                    outline = self.colors["current_outline"] if state == self.base else self.colors["placed_outline"]
                     label = "current" if state == self.base else "placed"
                     monitor_alpha = perspective_alpha if state == self.base else min(perspective_alpha, 0.50)
                 self.draw_monitor(cr, state, rect, fill, outline, label, alpha=monitor_alpha)
@@ -2045,11 +2179,11 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
         ) -> None:
             left, top, right, bottom = rect
             self.draw_rectangle(cr, left, top, right, bottom, fill, outline, 3, fill_alpha=alpha, outline_alpha=alpha)
-            self.draw_text(cr, left + 14, top + 16, state.name, "#ffffff", 13, bold=True, alpha=alpha)
+            self.draw_text(cr, left + 14, top + 16, state.name, self.colors["text"], 13, bold=True, alpha=alpha)
             text = f"{label}  {state.mode}  {state.width}x{state.height}  rot {state.rotation}"
             if state.output.simulated:
                 text += "  simulated"
-            self.draw_text(cr, left + 14, top + 43, text, "#edf1f5", 10, alpha=alpha)
+            self.draw_text(cr, left + 14, top + 43, text, self.colors["text_dim"], 10, alpha=alpha)
             if not state.connected:
                 badge_w = min(118, max(34, (right - left) - 28))
                 badge_left = right - badge_w - 12
@@ -2078,20 +2212,83 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
         ) -> None:
             if right - left < 34:
                 return
-            self.draw_rectangle(cr, left, top, right, bottom, "#4fd1c5", "#4fd1c5", 1, fill_alpha=alpha, outline_alpha=alpha)
-            self.draw_text(cr, (left + right) // 2, (top + bottom) // 2, rotation.upper(), "#0b1220", 8, bold=True, anchor="center", alpha=alpha)
+            self.draw_rectangle(
+                cr,
+                left,
+                top,
+                right,
+                bottom,
+                self.colors["orientation"],
+                self.colors["orientation"],
+                1,
+                fill_alpha=alpha,
+                outline_alpha=alpha,
+            )
+            self.draw_text(
+                cr,
+                (left + right) // 2,
+                (top + bottom) // 2,
+                rotation.upper(),
+                self.colors["orientation_text"],
+                8,
+                bold=True,
+                anchor="center",
+                alpha=alpha,
+            )
 
         def draw_unavailable_badge(self, cr: object, left: int, top: int, right: int, bottom: int, alpha: float = 1.0) -> None:
             if right - left < 34:
                 return
-            self.draw_rectangle(cr, left, top, right, bottom, "#d1d5db", "#d1d5db", 1, fill_alpha=alpha, outline_alpha=alpha)
-            self.draw_text(cr, (left + right) // 2, (top + bottom) // 2, "DISCONNECTED", "#111827", 8, bold=True, anchor="center", alpha=alpha)
+            self.draw_rectangle(
+                cr,
+                left,
+                top,
+                right,
+                bottom,
+                self.colors["disconnected_outline"],
+                self.colors["disconnected_outline"],
+                1,
+                fill_alpha=alpha,
+                outline_alpha=alpha,
+            )
+            self.draw_text(
+                cr,
+                (left + right) // 2,
+                (top + bottom) // 2,
+                "DISCONNECTED",
+                readable_text_color(self.colors["disconnected_outline"]),
+                8,
+                bold=True,
+                anchor="center",
+                alpha=alpha,
+            )
 
         def draw_primary_badge(self, cr: object, left: int, top: int, right: int, bottom: int, alpha: float = 1.0) -> None:
             if right - left < 34:
                 return
-            self.draw_rectangle(cr, left, top, right, bottom, "#e0a84f", "#e0a84f", 1, fill_alpha=alpha, outline_alpha=alpha)
-            self.draw_text(cr, (left + right) // 2, (top + bottom) // 2, "PRIMARY", "#111827", 8, bold=True, anchor="center", alpha=alpha)
+            self.draw_rectangle(
+                cr,
+                left,
+                top,
+                right,
+                bottom,
+                self.colors["primary"],
+                self.colors["primary"],
+                1,
+                fill_alpha=alpha,
+                outline_alpha=alpha,
+            )
+            self.draw_text(
+                cr,
+                (left + right) // 2,
+                (top + bottom) // 2,
+                "PRIMARY",
+                self.colors["primary_text"],
+                8,
+                bold=True,
+                anchor="center",
+                alpha=alpha,
+            )
 
         def candidate_display_size(self, state: GuiOutputState) -> tuple[int, int]:
             mode = output_largest_mode(state.output)
@@ -2147,28 +2344,39 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
             for index, (state, rect) in enumerate(self.thumbnail_items(width, height, display_base), start=1):
                 left, top, right, bottom = rect
                 if state == self.base:
-                    fill = "#2f7fbd"
-                    outline = "#f2f4f8"
+                    fill = self.colors["current_fill"]
+                    outline = self.colors["current_outline"]
                     fill_alpha = 1.0
                 elif not state.connected:
-                    fill = "#4b5563"
-                    outline = "#c2cad6"
+                    fill = self.colors["disconnected_fill"]
+                    outline = self.colors["disconnected_outline"]
                     fill_alpha = 0.72
                 elif state.enabled:
-                    fill = "#2f3744"
-                    outline = "#7d8796"
+                    fill = self.colors["placed_fill"]
+                    outline = self.colors["placed_outline"]
                     fill_alpha = 0.50
                 else:
-                    fill = "#222936"
-                    outline = "#e0a84f" if state == target else "#6d7787"
+                    fill = self.colors["available_fill"]
+                    outline = self.colors["target_outline"] if state == target else self.colors["placed_outline"]
                     fill_alpha = 1.0
                 alpha = min(fill_alpha, perspective_alpha)
                 line_width = 4 if state.enabled else 3 if state == target else 2
                 self.draw_rectangle(cr, left, top, right, bottom, fill, outline, line_width, fill_alpha=alpha, outline_alpha=alpha)
                 if state == target:
-                    self.draw_rectangle(cr, left + 5, top + 5, right - 5, bottom - 5, fill, "#e0a84f", 2, fill_alpha=alpha, outline_alpha=alpha)
-                self.draw_text(cr, left + 8, top + 8, str(index), "#e0a84f", 9, bold=True, alpha=alpha)
-                self.draw_text(cr, left + 22, top + 8, state.name, "#ffffff", 9, bold=True, alpha=alpha)
+                    self.draw_rectangle(
+                        cr,
+                        left + 5,
+                        top + 5,
+                        right - 5,
+                        bottom - 5,
+                        fill,
+                        self.colors["target_outline"],
+                        2,
+                        fill_alpha=alpha,
+                        outline_alpha=alpha,
+                    )
+                self.draw_text(cr, left + 8, top + 8, str(index), self.colors["target_outline"], 9, bold=True, alpha=alpha)
+                self.draw_text(cr, left + 22, top + 8, state.name, self.colors["text"], 9, bold=True, alpha=alpha)
                 if not state.connected:
                     self.draw_unavailable_thumbnail_badge(cr, right - 22, top + 6, right - 6, top + 22, alpha)
                 if state.primary:
@@ -2179,13 +2387,13 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
                 if state.rotation != "normal":
                     status = f"{status} rot {state.rotation}"
                 source_w, source_h = self.candidate_display_size(state)
-                self.draw_text(cr, left + 8, bottom - 20, f"{source_w}x{source_h}", "#d6dbe4", 8, alpha=alpha)
-                self.draw_text(cr, left + 8, bottom - 9, status, "#d6dbe4", 7, alpha=alpha)
+                self.draw_text(cr, left + 8, bottom - 20, f"{source_w}x{source_h}", self.colors["text_dim"], 8, alpha=alpha)
+                self.draw_text(cr, left + 8, bottom - 9, status, self.colors["text_dim"], 7, alpha=alpha)
 
         def draw_selected_edge(self, cr: object, rect: tuple[int, int, int, int]) -> None:
             left, top, right, bottom = rect
             side, _align = self.placement()
-            self.set_color(cr, "#e0a84f")
+            self.set_color(cr, self.colors["target_outline"])
             cr.set_line_width(7)
             if side == "right":
                 cr.move_to(right, top)
@@ -2223,36 +2431,100 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
             panel_w = 620
             panel_h = 112 + (len(self.help_rows()) * row_h)
             top = max(18, height - panel_h - 22)
-            self.draw_translucent_rectangle(cr, left, top, left + panel_w, top + panel_h, "#0b0f14", 0.82, "#8d98aa", 0.82, 1)
+            self.draw_translucent_rectangle(
+                cr,
+                left,
+                top,
+                left + panel_w,
+                top + panel_h,
+                self.colors["panel_bg"],
+                0.82,
+                self.colors["panel_outline"],
+                0.82,
+                1,
+            )
 
             text_left = left + 18
             key_left = left + 22
             action_left = left + 142
             y = top + 18
-            self.draw_text(cr, text_left, y, "better-randr hotkeys", "#f2f4f8", 13, bold=True)
+            self.draw_text(cr, text_left, y, "betr-randr hotkeys", self.colors["text"], 13, bold=True)
             y += 28
-            self.draw_text(cr, text_left, y, self.status, "#d6dbe4", 10)
+            self.draw_text(cr, text_left, y, self.status, self.colors["text_dim"], 10)
             y += 22
-            self.draw_text(cr, text_left, y, f"Selected edge: {self.placement_label()}", "#d6dbe4", 10)
+            self.draw_text(cr, text_left, y, f"Selected edge: {self.placement_label()}", self.colors["text_dim"], 10)
             y += 30
 
             for key, action in self.help_rows():
                 self.draw_key_label(cr, key_left, y - 3, key)
-                self.draw_text(cr, action_left, y, action, "#cbd2dd", 10)
+                self.draw_text(cr, action_left, y, action, self.colors["text_dim"], 10)
                 y += row_h
 
         def draw_key_label(self, cr: object, x: int, y: int, label: str) -> None:
             label_w = max(44, int(len(label) * 8.5) + 18)
-            self.draw_translucent_rectangle(cr, x, y, x + label_w, y + 18, "#1f2937", 0.92, "#e0a84f", 0.90, 1)
-            self.draw_text(cr, x + 9, y + 3, label, "#f2f4f8", 9, bold=True)
+            self.draw_translucent_rectangle(
+                cr,
+                x,
+                y,
+                x + label_w,
+                y + 18,
+                self.colors["key_bg"],
+                0.92,
+                self.colors["target_outline"],
+                0.90,
+                1,
+            )
+            self.draw_text(cr, x + 9, y + 3, label, self.colors["text"], 9, bold=True)
 
         def draw_primary_thumbnail_badge(self, cr: object, left: int, top: int, right: int, bottom: int, alpha: float = 1.0) -> None:
-            self.draw_rectangle(cr, left, top, right, bottom, "#e0a84f", "#e0a84f", 1, fill_alpha=alpha, outline_alpha=alpha)
-            self.draw_text(cr, (left + right) // 2, (top + bottom) // 2, "P", "#111827", 8, bold=True, anchor="center", alpha=alpha)
+            self.draw_rectangle(
+                cr,
+                left,
+                top,
+                right,
+                bottom,
+                self.colors["primary"],
+                self.colors["primary"],
+                1,
+                fill_alpha=alpha,
+                outline_alpha=alpha,
+            )
+            self.draw_text(
+                cr,
+                (left + right) // 2,
+                (top + bottom) // 2,
+                "P",
+                self.colors["primary_text"],
+                8,
+                bold=True,
+                anchor="center",
+                alpha=alpha,
+            )
 
         def draw_unavailable_thumbnail_badge(self, cr: object, left: int, top: int, right: int, bottom: int, alpha: float = 1.0) -> None:
-            self.draw_rectangle(cr, left, top, right, bottom, "#d1d5db", "#d1d5db", 1, fill_alpha=alpha, outline_alpha=alpha)
-            self.draw_text(cr, (left + right) // 2, (top + bottom) // 2, "!", "#111827", 8, bold=True, anchor="center", alpha=alpha)
+            self.draw_rectangle(
+                cr,
+                left,
+                top,
+                right,
+                bottom,
+                self.colors["disconnected_outline"],
+                self.colors["disconnected_outline"],
+                1,
+                fill_alpha=alpha,
+                outline_alpha=alpha,
+            )
+            self.draw_text(
+                cr,
+                (left + right) // 2,
+                (top + bottom) // 2,
+                "!",
+                readable_text_color(self.colors["disconnected_outline"]),
+                8,
+                bold=True,
+                anchor="center",
+                alpha=alpha,
+            )
 
         def draw_translucent_rectangle(
             self,
@@ -2344,7 +2616,6 @@ def launch_overlay(outputs: list[Output], dry_run: bool, compositor: str = "auto
                 return
             self.close()
 
-    Gtk.init([])
     OverlayEditor()
     Gtk.main()
     return 0
@@ -2445,6 +2716,11 @@ def parse_args() -> argparse.Namespace:
         help="print the parsed monitor layout and exit without opening rofi",
     )
     parser.add_argument(
+        "--check-deps",
+        action="store_true",
+        help="check required and optional external dependencies, then exit",
+    )
+    parser.add_argument(
         "--project",
         choices=("menu", *PROJECT_MODES),
         help="open the display-mode menu or apply a Windows-style display mode directly",
@@ -2470,6 +2746,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.check_deps:
+        return print_dependency_check()
+
     require_binary("xrandr")
     needs_rofi = not args.gui and (args.project is None or args.project == "menu") and not args.print_layout
     if needs_rofi:

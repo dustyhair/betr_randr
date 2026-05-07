@@ -1,6 +1,6 @@
-# better_randr
+# betr_randr
 
-`better_randr` is a small display-mode switcher for i3/X11, backed by `xrandr`.
+`betr_randr` is a small display-mode switcher for i3/X11, backed by `xrandr`.
 It is intended to feel closer to the Windows display function key / `Win+P`
 workflow, with an advanced layout editor available when the simple modes are not
 enough.
@@ -15,10 +15,16 @@ enough.
   `python3-cairo`, and GTK 3 on Debian/Ubuntu)
 - Optional: `picom` or `xcompmgr` for a fully transparent overlay background
 
+To check the local environment:
+
+```sh
+./bin/betr-randr --check-deps
+```
+
 ## Run
 
 ```sh
-./bin/better-randr
+./bin/betr-randr
 ```
 
 The default command opens Rofi first. Choose `advanced placement overlay` to
@@ -36,47 +42,47 @@ The top-level Rofi menu includes these display modes:
 For a function-key style binding, use the project menu directly:
 
 ```sh
-./bin/better-randr --project menu
+./bin/betr-randr --project menu
 ```
 
 You can also apply a mode directly:
 
 ```sh
-./bin/better-randr --project extend
-./bin/better-randr --project duplicate
-./bin/better-randr --project internal-only
-./bin/better-randr --project external-only
+./bin/betr-randr --project extend
+./bin/betr-randr --project duplicate
+./bin/betr-randr --project internal-only
+./bin/betr-randr --project external-only
 ```
 
 To skip Rofi and open the overlay directly:
 
 ```sh
-./bin/better-randr --gui
+./bin/betr-randr --gui
 ```
 
 To work on the interface without plugging in another monitor, add a simulated
 connected output:
 
 ```sh
-./bin/better-randr --gui --simulate-monitor --dry-run
+./bin/betr-randr --gui --simulate-monitor --dry-run
 ```
 
 You can give the fake output a name and mode:
 
 ```sh
-./bin/better-randr --gui --simulate-monitor SIM-1:2560x1440 --dry-run
+./bin/betr-randr --gui --simulate-monitor SIM-1:2560x1440 --dry-run
 ```
 
 To start a simulated monitor already attached, add `+X+Y` geometry:
 
 ```sh
-./bin/better-randr --gui --simulate-monitor SIM-1:1920x1080+1920+0 --dry-run
+./bin/betr-randr --gui --simulate-monitor SIM-1:1920x1080+1920+0 --dry-run
 ```
 
 Or attach it relative to the current monitor:
 
 ```sh
-./bin/better-randr --gui --dry-run \
+./bin/betr-randr --gui --dry-run \
   --simulate-monitor SIM-ATTACHED:1920x1080@right \
   --simulate-monitor SIM-AVAILABLE:2560x1440
 ```
@@ -84,7 +90,7 @@ Or attach it relative to the current monitor:
 To simulate four monitors with one already attached and three available:
 
 ```sh
-./bin/better-randr --gui --dry-run --simulate-layout four-one-attached
+./bin/betr-randr --gui --dry-run --simulate-layout four-one-attached
 ```
 
 Simulated monitors are only for interaction testing. In a normal apply, fake
@@ -168,18 +174,19 @@ translucent panel with a hotkey/action table.
 The overlay focuses itself but does not actively grab the keyboard, so global i3
 bindings such as Print Screen can still pass through.
 
-The overlay uses GTK/Cairo ARGB drawing for the background only. If no X
-compositor is running, `better-randr` tries to start `picom` first, then
-`xcompmgr`. To leave compositor management to your i3 session:
+The overlay uses GTK/Cairo ARGB drawing and derives its palette from the active
+GTK theme background, foreground, and selected/accent colors. If no X compositor
+is running, `betr-randr` tries to start `picom` first, then `xcompmgr`. To leave
+compositor management to your i3 session:
 
 ```sh
-./bin/better-randr --gui --compositor none
+./bin/betr-randr --gui --compositor none
 ```
 
 To inspect the parsed layout without opening Rofi:
 
 ```sh
-./bin/better-randr --print-layout
+./bin/betr-randr --print-layout
 ```
 
 Rotation maps directly to `xrandr --rotate`, so the generated commands are:
@@ -196,7 +203,7 @@ xrandr --output HDMI-A-0 --rotate inverted
 Add a binding like this to your i3 config:
 
 ```i3
-bindsym $mod+p exec --no-startup-id /home/jwagner/Development/side_projects/better_randr/bin/better-randr --project menu
+bindsym $mod+p exec --no-startup-id /home/jwagner/Development/side_projects/betr_randr/bin/betr-randr --project menu
 ```
 
 Reload i3 after editing the config.
@@ -205,24 +212,28 @@ If your laptop exposes a monitor/projector function key as a keysym, bind that
 keysym to the same command. For example, after identifying the key with `xev`:
 
 ```i3
-bindsym XF86Display exec --no-startup-id /home/jwagner/Development/side_projects/better_randr/bin/better-randr --project menu
+bindsym XF86Display exec --no-startup-id /home/jwagner/Development/side_projects/betr_randr/bin/betr-randr --project menu
 ```
 
 If you always want the overlay editor:
 
 ```i3
-bindsym $mod+p exec --no-startup-id /home/jwagner/Development/side_projects/better_randr/bin/better-randr --gui
+bindsym $mod+p exec --no-startup-id /home/jwagner/Development/side_projects/betr_randr/bin/betr-randr --gui
 ```
 
 ## Theme
 
 By default, the script uses your active Rofi theme. You can add extra Rofi theme
 colors and adds only sizing/spacing/font tweaks for the layout preview. You can
-replace those tweaks with `BETTER_RANDR_ROFI_THEME_STR`:
+replace those tweaks with `BETR_RANDR_ROFI_THEME_STR`:
 
 ```sh
-BETTER_RANDR_ROFI_THEME_STR='window { width: 42em; }' ./bin/better-randr
+BETR_RANDR_ROFI_THEME_STR='window { width: 42em; }' ./bin/betr-randr
 ```
 
 That keeps the menu compatible with both dark and light themes while still
 allowing project-specific sizing or layout tweaks.
+
+## License
+
+This project is released under CC0 1.0 Universal. See [LICENSE](LICENSE).

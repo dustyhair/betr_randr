@@ -1,17 +1,19 @@
 import importlib.util
+import io
 from importlib.machinery import SourceFileLoader
 import sys
 import unittest
+from contextlib import redirect_stdout
 from unittest import mock
 from pathlib import Path
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "better-randr"
+SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "betr-randr"
 
 
 def load_module():
-    loader = SourceFileLoader("better_randr", str(SCRIPT))
-    spec = importlib.util.spec_from_loader("better_randr", loader)
+    loader = SourceFileLoader("betr_randr", str(SCRIPT))
+    spec = importlib.util.spec_from_loader("betr_randr", loader)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader
     sys.modules[spec.name] = module
@@ -398,6 +400,43 @@ class CompositorTests(unittest.TestCase):
 
         self.assertEqual("Started xcompmgr for overlay transparency.", status)
         self.assertEqual([mock.call("picom"), mock.call("xcompmgr")], start_compositor.mock_calls)
+
+
+class DependencyCheckTests(unittest.TestCase):
+    def test_dependency_statuses_report_required_and_optional_tools(self):
+        br = load_module()
+
+        def fake_which(name):
+            return f"/usr/bin/{name}" if name in {"xrandr", "rofi", "picom"} else None
+
+        with mock.patch.object(br.shutil, "which", side_effect=fake_which), mock.patch.object(
+            br, "python_module_available", return_value=True
+        ):
+            statuses = br.dependency_statuses()
+
+        status_by_name = {name: (required, available) for name, _purpose, required, available in statuses}
+        self.assertEqual((True, True), status_by_name["xrandr"])
+        self.assertEqual((True, True), status_by_name["rofi"])
+        self.assertEqual((False, True), status_by_name["picom or xcompmgr"])
+        self.assertEqual((False, False), status_by_name["xprop"])
+
+    def test_print_dependency_check_fails_when_required_dependency_is_missing(self):
+        br = load_module()
+
+        with mock.patch.object(
+            br,
+            "dependency_statuses",
+            return_value=[
+                ("xrandr", "required for display query/apply", True, False),
+                ("picom or xcompmgr", "optional compositor for transparent overlay", False, False),
+            ],
+        ):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                status = br.print_dependency_check()
+
+        self.assertEqual(1, status)
+        self.assertIn("missing xrandr", output.getvalue())
 
 
 if __name__ == "__main__":
